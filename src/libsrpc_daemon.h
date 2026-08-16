@@ -1,0 +1,6 @@
+#ifndef FILE_LIBSRPC_DAEMON_H
+#define FILE_LIBSRPC_DAEMON_H
+
+
+
+#endif // FILE_LIBSRPC_DAEMON_H
