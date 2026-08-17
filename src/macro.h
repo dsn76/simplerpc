@@ -1,3 +1,5 @@
+/* https://github.com/pfultz2/Cloak */
+
 #ifndef FILE_MACRO_H
 #define FILE_MACRO_H
 

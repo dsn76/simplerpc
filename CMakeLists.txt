@@ -1,11 +1,22 @@
 cmake_minimum_required(VERSION 3.10)
-project(srpc C)
+
+project(srpc
+    VERSION 0.1.1
+    LANGUAGES C
+)
+message(STATUS "================================")
+message(STATUS "Configuring ${PROJECT_NAME} version ${PROJECT_VERSION}")
+message(STATUS "================================")
 
 # Глобальные опции проекта
 set(BUILD_TYPE "release" CACHE STRING "Build type: debug / release")
 #set(BUILD_TYPE "debug" CACHE STRING "Build type: debug / release")
 #set(ENABLE_SANITIZER  ON CACHE BOOL   "Enable ASan/UBSan")
 set(ENABLE_SANITIZER  OFF CACHE BOOL   "Enable ASan/UBSan")
+
+# Параметры shared memory
+set(SHMEM_SIZE_KB   2048             CACHE STRING "Shared memory size in KB")
+set(SHMEM_BASE_VADR "0x200000000000" CACHE STRING "Base virtual address for shared memory")
 
 # === Настройки компилятора ===
 set(CMAKE_C_STANDARD 11)
@@ -32,6 +43,13 @@ elseif(_bt STREQUAL "release")
 else()
     message(FATAL_ERROR "Unknown BUILD_TYPE '${BUILD_TYPE}'. Use: debug / release")
 endif()
+
+# === Параметры памяти → PROJECT_C_FLAGS ===
+math(EXPR SHMEM_SIZE_BYTES "${SHMEM_SIZE_KB} * 1024")
+list(APPEND PROJECT_C_FLAGS
+    -DSHMEM_BASE_VADR=${SHMEM_BASE_VADR}ULL
+    -DSHMEM_SIZE=${SHMEM_SIZE_BYTES}ULL
+)
 
 # ============================================================
 # libtlsf.a — статическая библиотека из внешних исходников
@@ -91,4 +109,11 @@ target_link_libraries(srpc tlsf dl)
 # Подключаем подкаталог с примерами
 # ============================================================
 add_subdirectory(example)
+
+# ============================================================
+# Замеры производительности (bench/run_bench.sh)
+# ============================================================
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench/CMakeLists.txt)
+    add_subdirectory(bench)
+endif()
 

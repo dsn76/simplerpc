@@ -87,7 +87,7 @@ int libsrpc_shmem_create(libsrpc_shmem_pool_t *pool, char *name, size_t size, ui
 
     pool->shm_size = size;
 
-    pool->shm = mmap( (void*)virtaddr, size, PROT_READ | PROT_WRITE, MAP_SHARED, pool->shm_fd, 0);
+    pool->shm = mmap( (void*)virtaddr, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED_NOREPLACE, pool->shm_fd, 0);
     if (pool->shm == MAP_FAILED) {
         pool->shm = NULL;
         rc = -errno;
@@ -362,10 +362,16 @@ int libsrpc_shmem_reg_pid(pid_t pid)
     libsrpc_shmem_pid_t *pid_info;
     libsrpc_shmem_t *shm = simplerpc_data->shmempool.shm;
 
+    pid_info = libsrpc_shmem_get_reg_pid(pid);
+    if(pid_info) {
+        DBG_PRINT("pid=%d already registered\n", pid);
+        return(0);
+    }
+
     pid_info = libsrpc_shmem_malloc(sizeof(libsrpc_shmem_pid_t));
     if(!pid_info) {
         rc = -ENOMEM;
-        ERR_PRINT("libsrpc_shmem_reg_pid: malloc failed\n");
+        ERR_PRINT("malloc failed\n");
         goto err;
     }
 
@@ -374,7 +380,7 @@ int libsrpc_shmem_reg_pid(pid_t pid)
 
     rc = sem_init(&pid_info->sem, 1, 0);
     if(rc < 0) {
-        ERR_PRINT("libsrpc_shmem_reg_pid: sem_init failed: %s\n", strerror(rc));
+        ERR_PRINT("sem_init failed: %s\n", strerror(rc));
         goto err;
     }
 
@@ -382,10 +388,10 @@ int libsrpc_shmem_reg_pid(pid_t pid)
 
     rc = list_add_tail(&shm->reg_pid_list, &pid_info->list);
     if(rc < 0) {
-        ERR_PRINT("libsrpc_shmem_reg_pid: dlist_push_front failed: %s\n", strerror(rc));
+        ERR_PRINT("dlist_push_front failed: %s\n", strerror(rc));
         goto err;
     }
-    DBG_PRINT("libsrpc_shmem_reg_pid: pid=%d registered pid_info=%p\n", pid, pid_info);
+    DBG_PRINT("pid=%d registered pid_info=%p\n", pid, pid_info);
 end:
     return(rc);
 err:
@@ -397,17 +403,22 @@ int libsrpc_shmem_unreg_pid(pid_t pid)
 {
     int rc = 0;
     libsrpc_shmem_pid_t *pid_info = NULL;
+    libsrpc_shmem_t *shm = simplerpc_data->shmempool.shm;
 
     pid_info = libsrpc_shmem_get_reg_pid(pid);
     if(pid_info) {
         sem_destroy(&pid_info->sem);
         srpc_thread_rcv_queue_clear(pid_info);
+        list_remove(&shm->reg_pid_list, &pid_info->list);
         libsrpc_shmem_free(pid_info);
     }
-    DBG_PRINT("libsrpc_shmem_unreg_pid: pid=%d unregistered pid_info=%p\n", pid, pid_info);
+    DBG_PRINT("pid=%d unregistered pid_info=%p\n", pid, pid_info);
     return(rc);
 }
 
+/* Отсутствуют блокировки и счётчик ссылок, потому что эта функция вызывается только регистрируемым процессов и демоном.
+ * Если процесс упадёт, то демоно зачистит разделяемую память и освободит все ресурсы.
+ * Если нужно другое поведение, то нужно добавить блокировки или счётчик ссылок. */
 libsrpc_shmem_pid_t* libsrpc_shmem_get_reg_pid(pid_t pid)
 {
     libsrpc_shmem_pid_t *pid_info = NULL;
@@ -424,7 +435,7 @@ libsrpc_shmem_pid_t* libsrpc_shmem_get_reg_pid(pid_t pid)
         }
     list_unlock(&shm->reg_pid_list);
     }
-    DBG_PRINT("libsrpc_shmem_get_reg_pid: pid=%d get registered pid_info=%p\n", pid, pid_info);
+    DBG_PRINT("pid=%d get registered pid_info=%p\n", pid, pid_info);
     return(pid_info);
 }
 

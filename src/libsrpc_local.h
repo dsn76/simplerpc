@@ -11,8 +11,12 @@
 #include "libsrpc_shmem.h"
 
 #define CACHELINESIZE   (64)
-#define SHMEM_BASE_VADR (0x200000000000)
-#define SHMEM_SIZE      (2*1024*1024)
+#ifndef SHMEM_BASE_VADR
+#define SHMEM_BASE_VADR (0x200000000000ULL)
+#endif
+#ifndef SHMEM_SIZE
+#define SHMEM_SIZE      (2ULL*1024ULL*1024ULL)
+#endif
 
 typedef struct srpc_func_s {
   const void *rpc; // Указатель на функцию в библиотеке libsrpc.

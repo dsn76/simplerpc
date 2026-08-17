@@ -15,7 +15,13 @@
 #include "libsrpc_mpmcq.h"
 #include "libsrpc_futex.h"
 
+/* Вся эта препроцессорная магия нужна, потому что стандартизаторы Си,
+ * до исх пор не осилили нормальную прероцесорную кодогенерацию для: сериализации/десериализации параметров функций,
+ * полей структур, итп. Даже простой битовый циклический сдвиг - в Си отсутствет как отдельная операция.
+ */
 /* ============================================================================== */
+/* Макросы для генерации аргументов функций, тела функций и размера буфера запроса. */
+/* ------------------------------------------------------------------------------ */
 #include "macro.h"
 #define M_GENARG(t,v,f) t v COMMA_IF(f)
 #define M_ARGFUN(...) EVAL(FOREACH2(M_GENARG,p,,__VA_ARGS__))
@@ -42,6 +48,8 @@
 #define RETDATA(type, data) EVAL(IIF(EQUAL(type,void))(return,return(*(type*)(data))))
 /* ============================================================================== */
 
+/* Определяет версию библиотеки, приложения слинкованные с разными версиями не будут взаимодействовать друг с другом.
+ * Это защита от несовместимости версий библиотеки и приложения. */
 #ifndef BUILD_TS
 #define BUILD_TS "00000000000000" // Значение по умолчанию
 #endif
@@ -50,12 +58,13 @@ static const char *daemon_name = "simplerpc_" BUILD_TS;
 static simplerpc_t srpc;
 simplerpc_t *simplerpc_data = &srpc;
 /* ============================================================================== */
-/* RPC */
+/* Деструктор данных потока */
 static pthread_key_t srpc_key;
 static pthread_once_t srpc_key_once = PTHREAD_ONCE_INIT;
 
 void cleanup_my_data(void *ptr)
 {
+  if(!ptr) return;
   free(ptr);
 }
 
@@ -77,6 +86,11 @@ static void srpc_set_data(void *ptr) {
 }
 
 /* ------------------------------------------------------------------------------ */
+// Флаг для отключения рекурсии при вызове RPC функций.
+_Thread_local static atomic_char srpc_disable_rpc_recursion = 0;
+
+typedef int srpc_rc_t; // Внутренний код возврата при выполнении RPC запроса, возникший в исполнителе.
+
 // Структура данных для отправки RPC запроса.
 typedef struct srpc_req_s {
   job_futex_t jf; // futex для уведомления о завершении работы.
@@ -87,8 +101,42 @@ typedef struct srpc_req_s {
   int retsz; // Размер одного ответа.
   int retnum; // Количество ответов в буфере.
   int retpos; // Позиция в буфере для размещения первого ответа.
-  char buf[0]; // Буфер данных.
+  char buf[0]; // /* Структура данных в buf[0]: {Параметры функции {...}, результаты выполнения функции по числу исполнителей: {srpc_rc_t, rettype, ...} }. */
 } srpc_req_t;
+/* ------------------------------------------------------------------------------ */
+static int libsrpc_req_rc_set(srpc_req_t *req, int idx, srpc_rc_t rc)
+{
+  if(!req || idx < 0 || idx >= req->retnum) {
+    return(-EINVAL);
+  }
+  int rcoff = idx * req->retsz + req->retpos;
+  memcpy(&req->buf[rcoff], &rc, sizeof(srpc_rc_t));
+  return(0);
+}
+
+int libsrpc_lastreq_get(int idx, void *retval, size_t sz)
+{
+  srpc_rc_t rc = 0;
+  srpc_req_t *req = srpc_get_data();
+  if(!req || idx < 0 || idx >= req->retnum) {
+    return(-ENOTAVAILABLE);
+  }
+
+  int rcoff = idx * req->retsz + req->retpos;
+  int retoff = rcoff + sizeof(srpc_rc_t);
+
+  if(retval != NULL && sz > 0) {
+    if(sz != req->retsz) {
+      return(-EBADMSG);
+    }
+    memcpy(retval, &req->buf[retoff], sz);
+  }
+
+  memcpy(&rc, &req->buf[rcoff], sizeof(srpc_rc_t));
+  return(rc);
+}
+
+/* ------------------------------------------------------------------------------ */
 
 // Отправка RPC запроса.
 static void sRPCsend(srpc_req_t *req)
@@ -99,6 +147,14 @@ static void sRPCsend(srpc_req_t *req)
 
   if(!req) {
     __libsrpc_errno_set(EINVAL);
+    return;
+  }
+  if(srpc_disable_rpc_recursion) {
+    __libsrpc_errno_set(ERECURSIVE);
+    return;
+  }
+  if(!simplerpc_data->rpc_enable) {
+    __libsrpc_errno_set(ERPCDISABLE);
     return;
   }
 
@@ -130,18 +186,19 @@ DBG_PRINT("sRPCsend: send request to %d workers\n", retnum);
       goto end; // Все запросы получены и исполнены.
     }
     if(rc == -ETIMEDOUT) {
-      /* Если все запросы получены, то ждём исполнения всех запросов бесконечно. */
+      /* Если все запросы получены, то ждём исполнения всех запросов бесконечно.
+       * Если процесс исполнитель упадёт, то нас разбудит демон, при зачистке его ресурсов. */
       if(atomic_load(&req->cnt_rcv) == req->retnum) timeout = JOB_FUTEX_INFINITE;
-      DBG_PRINT("sRPCsend: timeout waiting for client\n");
+      DBG_PRINT("timeout waiting for client\n");
     }else{
       /* Если ошибка не таймаут, то выходим. */
-      ERR_PRINT("sRPCsend: unexpected error waiting for client\n");
+      ERR_PRINT("unexpected error waiting for client\n");
       break;
     }
   }while(atomic_load(&req->cnt_rcv) != req->retnum || atomic_load(&req->cnt_send) != req->retnum);
 
 end:
-  DBG_PRINT("sRPCsend: wait for client done\n");
+  DBG_PRINT("wait for client done\n");
   return;
 }
 
@@ -151,7 +208,7 @@ static srpc_req_t* libsrpc_alloc_req(int funid, int reqlen, int retsz)
   libsrpc_shmem_t *shm = simplerpc_data->shmempool.shm;
   if(!shm) {
     __libsrpc_errno_set(EINVAL);
-    ERR_PRINT("libsrpc_alloc_req: shm is NULL\n");
+    ERR_PRINT("shm is NULL\n");
     return(NULL);
   }
   
@@ -161,7 +218,7 @@ static srpc_req_t* libsrpc_alloc_req(int funid, int reqlen, int retsz)
 
   if(retnum == 0) {
     __libsrpc_errno_set(ENOREGFUN);
-    ERR_PRINT("libsrpc_alloc_req: no registered functions '%s'\n", simplerpc_data->fn[sRPC_ID2IDX(funid)].name);
+    ERR_PRINT("no registered functions '%s'\n", simplerpc_data->fn[sRPC_ID2IDX(funid)].name);
     return(NULL);
   }
 
@@ -174,7 +231,7 @@ static srpc_req_t* libsrpc_alloc_req(int funid, int reqlen, int retsz)
   job_futex_init(&req->jf, retnum * 2); // *2 потому что каждый запрос будет отправлен и получен.
   req->funid = funid;
   req->bufsz = sz;
-  req->retsz = retsz;
+  req->retsz = retsz + sizeof(srpc_rc_t);
   req->retnum = retnum;
   req->retpos = reqlen;
 
@@ -186,12 +243,14 @@ void libsrpc_free_req(srpc_req_t *req)
   if(!req) {
     return;
   }
+  /* Проверим что все запросы выполнены и очистим память, иначе, отправим в список отложенных освобождений. */
+  DBG_PRINT("libsrpc_free_req: free request: req=%p\n", req);
   job_futex_destroy(&req->jf);
   libsrpc_shmem_free(req);
 }
 
 /* ------------------------------------------------------------------------------ */
-// Реализации функций обёрток над RPC=вызовом.
+// Реализации функций, перехватывающих обёрток, для RPC вызовов.
 #define XF(rettype,name,...) \
 static rettype sRPCFN(name)(M_ARGFUN(__VA_ARGS__)) { \
     int len=0; int rlen=0; int pos=0; \
@@ -204,8 +263,10 @@ static rettype sRPCFN(name)(M_ARGFUN(__VA_ARGS__)) { \
     if(req == NULL) { __libsrpc_errno_set(ENOMEM); }else{ \
       M_BODYFUN(__VA_ARGS__); \
       if(!!req && pos != len) { __libsrpc_errno_set(EBADMSG); }else{ \
+        int retoff = len + sizeof(srpc_rc_t); \
         sRPCsend(req); \
-        memcpy(rbuf, &req->buf[len], rlen); \
+        memcpy(rbuf, &req->buf[retoff], rlen); \
+        libsrpc_free_req(req); \
       } \
     } \
     DBG_PRINT("RPC call: %s %s(%s fnid=%d) len=%d retsz=%d\n", #rettype, #name, #__VA_ARGS__, GET_FNID(name), len, rlen); \
@@ -235,6 +296,269 @@ static simplerpc_t srpc = {
 };
 
 /* ============================================================================== */
+/* --- Макросы для десериализации и вызова (Callback) --- */
+
+// 1. Объявление переменных: int p1, char* p2, ...
+//#define M_DECL(t,v,f) t v COMMA_IF(f)
+#define M_DECL(t,v,f) t v;
+#define M_DECLFUN(...) EVAL(FOREACH2(M_DECL,p,,__VA_ARGS__))
+
+// 2. Извлечение из буфера: memcpy(&p1, &buf[pos], sizeof(p1)); pos += sizeof(p1); ...
+#define M_EXTRACT(t,v,f) memcpy(&v, &req->buf[pos], sizeof(v)); pos += sizeof(v);
+#define M_EXTRACTFUN(...) EVAL(FOREACH2(M_EXTRACT,p,,__VA_ARGS__))
+
+// 3. Генерация списка аргументов для вызова: p1, p2, ...
+#define M_ARGNAME(t,v,f) v COMMA_IF(f)
+#define M_ARGNAMES(...) EVAL(FOREACH2(M_ARGNAME,p,,__VA_ARGS__))
+
+/* RPC Callbacks */
+static int srpc_callback_func(srpc_req_t *req, int retidx) 
+{
+  int rc = 0;
+  int rcoff = retidx * req->retsz + req->retpos;
+  int retoff = rcoff + sizeof(srpc_rc_t);
+
+  atomic_fetch_add(&req->cnt_rcv, 1);
+  job_futex_worker_done(&req->jf);
+  switch(req->funid) {
+    #define XF(rettype,name,...) \
+        case GET_FNID(name): \
+            /* Защита от рекурсии: если зарегистрирована сама обертка */ \
+            if ((void*)&(name) == (void*)&(sRPCFN(name))) { rc = -1; break; } \
+            { \
+                int pos = 0; \
+                /* Объявляем переменные (int p, char* pp, ...) */ \
+                M_DECLFUN(__VA_ARGS__); \
+                /* Копируем данные из buf в переменные */ \
+                M_EXTRACTFUN(__VA_ARGS__); \
+                \
+                /* Вызываем функцию и обрабатываем возвращаемое значение */ \
+                IIF(EQUAL(rettype, void)) \
+                ( \
+                    /* Если void: просто вызываем */ \
+                    name(M_ARGNAMES(__VA_ARGS__)); \
+                , \
+                    /* Если не void: сохраняем результат и пишем в буфер ответов */ \
+                    rettype retval = name(M_ARGNAMES(__VA_ARGS__)); \
+                    memcpy(&req->buf[retoff], &retval, sizeof(retval)); \
+                ) \
+                (void)pos; \
+            } \
+            break;
+        RPC_LIST
+    #undef XF
+//    #define XF(rettype,name,...)   case sRPCFNID_##name: if( &(name) == &(sRPCFN(name)) ) break; break;
+//        RPC_LIST
+//    #undef XF
+    default:
+      ERR_PRINT("srpc_callback_func: BAD FUNID: funid=%d\n", req->funid);
+      rc = -1;
+      break;
+  } // switch(req->funid)
+  memcpy(&req->buf[rcoff], &rc, sizeof(srpc_rc_t));
+  atomic_fetch_add(&req->cnt_send, 1);
+  job_futex_worker_done(&req->jf);
+  return(rc);
+}
+/* ------------------------------------------------------------------------------ */
+// Поток приема и обработки запросов.
+static atomic_char srpc_thread_stop_flag = 0;
+
+static int srpc_dequeue_request(libsrpc_shmem_pid_t *pi)
+{
+  int rc = 0;
+  int n = 0;
+  Request qreq;
+
+  do{
+    n = mpmc_queue_try_dequeue(&pi->queue, &qreq);
+    if(n == 0) {
+      DBG_PRINT("dequeue empty[%d]: n=%d\n", sched_getcpu(), n);
+      break;
+    }
+    srpc_req_t *sreq = qreq.req;
+    if(!sreq || sreq->funid >= sRPCFNID_MAX || sreq->funid <= sRPCFNID_START) {
+      ERR_PRINT("BAD REQUEST: req=%p retsz=%d funid=%d\n", sreq, sreq->retsz, sreq->funid);
+      break;
+    }
+    DBG_PRINT("dequeue success[%d]: req.req=%p funid=%d retidx=%d retsz=%d\n", sched_getcpu(), sreq, sreq->funid, qreq.retidx, sreq->retsz);
+    rc = srpc_callback_func(sreq, qreq.retidx);
+    if(rc < 0) {
+      DBG_PRINT("callback function failed: rc=%d\n", rc);
+      break;
+    }
+  }while(n > 0);
+
+  return(rc);
+}
+
+// Функция потока приема и обработки запросов.
+static void * srpc_thread_rcv_req(void *arg) {
+  int rc = 0;
+  libsrpc_shmem_pid_t *pi = simplerpc_data->pid_info;
+  srpc_disable_rpc_recursion = 1;
+
+  DBG_PRINT("started CPU=%d\n", sched_getcpu());
+
+  atomic_fetch_add(&pi->threads_run, 1);
+  while(!srpc_thread_stop_flag) {
+    DBG_PRINT("wait for request[%d]\n", sched_getcpu());
+    atomic_fetch_add(&pi->threads_wait, 1);
+    rc = srpc_dequeue_request(pi); // Проверим очередь перед ожиданием, после atomic_fetch_add чтоб не проспать запрос.
+    rc = sem_wait(&pi->sem);
+    atomic_fetch_sub(&pi->threads_wait, 1);
+    DBG_PRINT("sem_wait wakeup success[%d]: rc=%d\n", sched_getcpu(), rc);
+    if(rc == -1 && errno == EINTR) continue;
+    if(rc == -1) {
+      ERR_PRINT("sem_wait failed: %s\n", strerror(errno));
+      break;
+    }
+DBG_PRINT("dequeue start[%d]: rc=%d\n", sched_getcpu(), n);
+  rc = srpc_dequeue_request(pi);
+DBG_PRINT("dequeue end[%d]: rc=%d\n", sched_getcpu(), n);
+  }
+  atomic_fetch_sub(&pi->threads_run, 1);
+
+  DBG_PRINT("stopped CPU=%d\n", sched_getcpu());
+  return(NULL);
+}
+
+int srpc_thread_rcv_req_start(void) {
+  int rc = 0;
+  rc = pthread_start_all_cpu(srpc_thread_rcv_req, NULL);
+  if (rc != 0) {
+    ERR_PRINT("pthread_start_all_cpu failed\n");
+    goto err;
+  }
+  DBG_PRINT("started all CPU threads\n");
+out:
+  return(rc);
+err:
+  goto out;
+}
+
+// Очистка очереди запросов.
+void srpc_thread_rcv_queue_clear(libsrpc_shmem_pid_t *pi)
+{
+  Request req;
+
+  /* освободим зависшие RPC запросы в очереди */
+  while(mpmc_queue_try_dequeue(&pi->queue, &req)) {
+    srpc_req_t *sreq = req.req;
+    atomic_fetch_add(&sreq->cnt_rcv, 1);
+    job_futex_worker_done(&sreq->jf);
+    /* Запрос не был выполнен, установим RC код ошибки. */
+    libsrpc_req_rc_set(sreq, req.retidx, ECANCELLED);
+    atomic_fetch_add(&sreq->cnt_send, 1);
+    job_futex_worker_done(&sreq->jf);
+  }
+}
+
+int srpc_thread_rcv_req_stop(void) {
+  int rc = 0;
+  libsrpc_shmem_pid_t *pi = simplerpc_data->pid_info;
+  int n = atomic_load(&pi->threads_wait) + 1;
+
+  atomic_store(&srpc_thread_stop_flag, 1);
+
+  for(int i = 0; i < n; i++) {
+    sem_post(&simplerpc_data->pid_info->sem);
+  }
+
+  // Очищаем очередь запросов.
+  srpc_thread_rcv_queue_clear(pi);
+
+  // Ждём пока все потоки завершатся.
+  while(pi->threads_run > 0) {
+    usleep(100);
+  }
+  
+  DBG_PRINT("send stopped\n");
+  return(rc);
+}
+
+/* ============================================================================== */
+// Регистрация своих функций в RPC.
+static int srpc_regfn_insert(srpc_regfn_block_t *block, libsrpc_shmem_pid_t *pid)
+{
+  int rc = -1;
+
+  // Надйдём свободный элемент для вставки.
+  while(block) {
+    for(int i = 0; i < SRPC_MAX_PID; i++) {
+      if(block->pids[i] == NULL) {
+        block->pids[i] = pid;
+        atomic_fetch_add(&block->num, 1);
+        rc = 0;
+        DBG_PRINT("!!! srpc_regfn_insert: %p insert '%s' OK\n", pid, srpc_fn[i].name);
+        goto end;
+      }
+    }
+    block = block->next;
+  }
+
+end:
+  return(rc);
+}
+
+static int srpc_regfn_remove(srpc_regfn_block_t *block, libsrpc_shmem_pid_t *pid) 
+{
+  int rc = 0;
+
+  while(block) {
+    for(int i = 0; i < SRPC_MAX_PID; i++) {
+      if(block->pids[i] == pid) {
+        block->pids[i] = NULL;
+        atomic_fetch_sub(&block->num, 1);
+        rc++;
+      }
+    }
+    block = block->next;
+  }
+
+  return(rc);
+}
+
+int srpc_regfn_rpc_shm(libsrpc_shmem_pid_t *fpid)
+{
+  int rc = 0;
+  libsrpc_shmem_t *shm = simplerpc_data->shmempool.shm;
+  srpc_regfn_shm_t *p_regfn = &shm->regfn;
+
+  pthread_mutex_lock(&p_regfn->mutex);
+  for(int i = 0; i < sRPC_FNNUM; i++) {
+    if(srpc_fn[i].loc != srpc_fn[i].rpc) {
+      rc = srpc_regfn_insert(&p_regfn->funcs[i].block, fpid);
+      if(rc == 0) {
+        DBG_PRINT("fpid=%p insert '%s' OK\n", fpid, srpc_fn[i].name);
+        atomic_fetch_add(&p_regfn->funcs[i].num_all, 1);
+      } else {
+        ERR_PRINT("fpid=%p insert '%s' failed\n", fpid, srpc_fn[i].name);
+      }
+    }
+  }
+  pthread_mutex_unlock(&p_regfn->mutex);
+
+  return(rc);
+}
+
+int srpc_unregfn_rpc_shm(libsrpc_shmem_pid_t *fpid)
+{
+  int rc = 0;
+  libsrpc_shmem_t *shm = simplerpc_data->shmempool.shm;
+  srpc_regfn_shm_t *p_regfn = &shm->regfn;
+
+  pthread_mutex_lock(&p_regfn->mutex);
+  for(int i = 0; i < sRPC_FNNUM; i++) {
+    rc = srpc_regfn_remove(&p_regfn->funcs[i].block, fpid);
+    if(rc > 0) atomic_fetch_sub(&p_regfn->funcs[i].num_all, rc);
+    DBG_PRINT("remove '%s' OK rc=%d\n", srpc_fn[i].name, rc);
+  }
+  pthread_mutex_unlock(&p_regfn->mutex);
+  return(rc);
+}
+
+/* ============================================================================== */
 /* SHARED MEMORY POLL and allocator */
 
 enum {
@@ -245,7 +569,7 @@ enum {
 static volatile char en_allocator = 0; // fucking TLS(thread local storage) |==:=>-.
 _Thread_local static atomic_char switch_allocator = SRPC_ALLOC_STD;
 
-#if 1
+#ifndef LIBSRPC_DISABLE_SUBSTITUTION_ALLOCATOR
 void srpc_alloc_sw_std(void) {
   switch_allocator = SRPC_ALLOC_STD;
 }
@@ -338,246 +662,6 @@ void free(void* ptr) {
   }
 }
 #endif
-/* ============================================================================== */
-// Регистрация своих функций в RPC.
-static int srpc_regfn_insert(srpc_regfn_block_t *block, libsrpc_shmem_pid_t *pid)
-{
-  int rc = -1;
-
-  // Надйдём свободный элемент для вставки.
-  while(block) {
-    for(int i = 0; i < SRPC_MAX_PID; i++) {
-      if(block->pids[i] == NULL) {
-        block->pids[i] = pid;
-        atomic_fetch_add(&block->num, 1);
-        rc = 0;
-        DBG_PRINT("!!! srpc_regfn_insert: %p insert '%s' OK\n", pid, srpc_fn[i].name);
-        goto end;
-      }
-    }
-    block = block->next;
-  }
-
-end:
-  return(rc);
-}
-
-static int srpc_regfn_remove(srpc_regfn_block_t *block, libsrpc_shmem_pid_t *pid) 
-{
-  int rc = 0;
-
-  while(block) {
-    for(int i = 0; i < SRPC_MAX_PID; i++) {
-      if(block->pids[i] == pid) {
-        block->pids[i] = NULL;
-        atomic_fetch_sub(&block->num, 1);
-        rc++;
-      }
-    }
-    block = block->next;
-  }
-
-  return(rc);
-}
-
-int srpc_regfn_rpc_shm(libsrpc_shmem_pid_t *fpid)
-{
-  int rc = 0;
-  libsrpc_shmem_t *shm = simplerpc_data->shmempool.shm;
-  srpc_regfn_shm_t *p_regfn = &shm->regfn;
-
-  //sRPC_IDX2ID(i)
-  pthread_mutex_lock(&p_regfn->mutex);
-  for(int i = 0; i < sRPC_FNNUM; i++) {
-    if(srpc_fn[i].loc != srpc_fn[i].rpc) {
-      rc = srpc_regfn_insert(&p_regfn->funcs[i].block, fpid);
-      if(rc == 0) {
-        DBG_PRINT("!!! srpc_regfn_rpc_shm: %p insert '%s' OK\n", fpid, srpc_fn[i].name);
-        atomic_fetch_add(&p_regfn->funcs[i].num_all, 1);
-      } else {
-        ERR_PRINT("srpc_regfn_rpc_shm: %p insert '%s' failed\n", fpid, srpc_fn[i].name);
-      }
-    }
-  }
-  pthread_mutex_unlock(&p_regfn->mutex);
-
-  return(rc);
-}
-
-int srpc_unregfn_rpc_shm(libsrpc_shmem_pid_t *fpid)
-{
-  int rc = 0;
-  libsrpc_shmem_t *shm = simplerpc_data->shmempool.shm;
-  srpc_regfn_shm_t *p_regfn = &shm->regfn;
-
-  pthread_mutex_lock(&p_regfn->mutex);
-  for(int i = 0; i < sRPC_FNNUM; i++) {
-    rc = srpc_regfn_remove(&p_regfn->funcs[i].block, fpid);
-    if(rc > 0) atomic_fetch_sub(&p_regfn->funcs[i].num_all, rc);
-    DBG_PRINT("!!! srpc_unregfn_rpc_shm: remove '%s' OK rc=%d\n", srpc_fn[i].name, rc);
-  }
-  pthread_mutex_unlock(&p_regfn->mutex);
-  return(rc);
-}
-
-/* ============================================================================== */
-/* --- Макросы для десериализации и вызова (Callback) --- */
-
-// 1. Объявление переменных: int p1, char* p2, ...
-//#define M_DECL(t,v,f) t v COMMA_IF(f)
-#define M_DECL(t,v,f) t v;
-#define M_DECLFUN(...) EVAL(FOREACH2(M_DECL,p,,__VA_ARGS__))
-
-// 2. Извлечение из буфера: memcpy(&p1, &buf[pos], sizeof(p1)); pos += sizeof(p1); ...
-#define M_EXTRACT(t,v,f) memcpy(&v, &req->buf[pos], sizeof(v)); pos += sizeof(v);
-#define M_EXTRACTFUN(...) EVAL(FOREACH2(M_EXTRACT,p,,__VA_ARGS__))
-
-// 3. Генерация списка аргументов для вызова: p1, p2, ...
-#define M_ARGNAME(t,v,f) v COMMA_IF(f)
-#define M_ARGNAMES(...) EVAL(FOREACH2(M_ARGNAME,p,,__VA_ARGS__))
-
-/* RPC Callbacks */
-static int srpc_callback_func(srpc_req_t *req) 
-{
-  int rc = 0;
-
-  atomic_fetch_add(&req->cnt_rcv, 1);
-  job_futex_worker_done(&req->jf);
-  switch(req->funid) {
-    #define XF(rettype,name,...) \
-        case GET_FNID(name): \
-            /* Защита от рекурсии: если зарегистрирована сама обертка */ \
-            if ((void*)&(name) == (void*)&(sRPCFN(name))) { rc = -1; break; } \
-            { \
-                int pos = 0; \
-                /* Объявляем переменные (int p, char* pp, ...) */ \
-                M_DECLFUN(__VA_ARGS__); \
-                /* Копируем данные из buf в переменные */ \
-                M_EXTRACTFUN(__VA_ARGS__); \
-                \
-                /* Вызываем функцию и обрабатываем возвращаемое значение */ \
-                IIF(EQUAL(rettype, void)) \
-                ( \
-                    /* Если void: просто вызываем */ \
-                    name(M_ARGNAMES(__VA_ARGS__)); \
-                , \
-                    /* Если не void: сохраняем результат и пишем в буфер ответов */ \
-                    rettype retval = name(M_ARGNAMES(__VA_ARGS__)); \
-                    memcpy(&req->buf[pos], &retval, sizeof(retval)); \
-                ) \
-            } \
-            break;
-        RPC_LIST
-    #undef XF
-//    #define XF(rettype,name,...)   case sRPCFNID_##name: if( &(name) == &(sRPCFN(name)) ) break; break;
-//        RPC_LIST
-//    #undef XF
-    default:
-      ERR_PRINT("srpc_callback_func: BAD FUNID: funid=%d\n", req->funid);
-      rc = -1;
-      break;
-  } // switch(req->funid)
-  atomic_fetch_add(&req->cnt_send, 1);
-  job_futex_worker_done(&req->jf);
-  return(rc);
-}
-/* ------------------------------------------------------------------------------ */
-// Поток приема и обработки запросов.
-int sched_getcpu(void);
-static atomic_char srpc_thread_stop_flag = 0;
-
-// Функция потока приема и обработки запросов.
-static void * srpc_thread_rcv_req(void *arg) {
-  int rc = 0;
-  int n = 0;
-  Request qreq;
-  libsrpc_shmem_pid_t *pi = simplerpc_data->pid_info;
-
-  DBG_PRINT("!!! srpc_thread_rcv_req: started CPU=%d\n", sched_getcpu());
-
-  atomic_fetch_add(&pi->threads_run, 1);
-  while(!srpc_thread_stop_flag) {
-    DBG_PRINT("srpc_thread_rcv_req: wait for request[%d]\n", sched_getcpu());
-    atomic_fetch_add(&pi->threads_wait, 1);
-    rc = sem_wait(&pi->sem);
-    atomic_fetch_sub(&pi->threads_wait, 1);
-    DBG_PRINT("sem_wait wakeup success[%d]: rc=%d\n", sched_getcpu(), rc);
-    if(rc == -1 && errno == EINTR) continue;
-    if(rc == -1) {
-      ERR_PRINT("srpc_thread_rcv_req: sem_wait failed: %s\n", strerror(errno));
-      break;
-    }
-DBG_PRINT("dequeue start[%d]: rc=%d\n", sched_getcpu(), n);
-    do{
-      n = mpmc_queue_try_dequeue(&pi->queue, &qreq);
-      if(n == 0) {
-        DBG_PRINT("dequeue empty[%d]: n=%d\n", sched_getcpu(), n);
-        break;
-      }
-      srpc_req_t *sreq = qreq.req;
-      if(!sreq || sreq->funid >= sRPCFNID_MAX || sreq->funid <= sRPCFNID_START) {
-        ERR_PRINT("srpc_thread_rcv_req: BAD REQUEST: req=%p retsz=%d funid=%d\n", sreq, sreq->retsz, sreq->funid);
-        break;
-      }
-      DBG_PRINT("dequeue success[%d]: req.req=%p funid=%d retidx=%d retsz=%d\n", sched_getcpu(), sreq, sreq->funid, qreq.retidx, sreq->retsz);
-      rc = srpc_callback_func(sreq);
-    }while(n > 0);
-DBG_PRINT("dequeue end[%d]: rc=%d\n", sched_getcpu(), n);
-  }
-  atomic_fetch_sub(&pi->threads_run, 1);
-
-  DBG_PRINT("!!! srpc_thread_rcv_req: stopped CPU=%d\n", sched_getcpu());
-  return(NULL);
-}
-
-int srpc_thread_rcv_req_start(void) {
-  int rc = 0;
-  rc = pthread_start_all_cpu(srpc_thread_rcv_req, NULL);
-  if (rc != 0) {
-    ERR_PRINT("srpc_thread_rcv_req_start: pthread_start_all_cpu failed\n");
-    goto err;
-  }
-  DBG_PRINT("srpc_thread_rcv_req_start: started\n");
-out:
-  return(rc);
-err:
-  return(rc);
-  goto out;
-}
-
-// Очистка очереди запросов.
-void srpc_thread_rcv_queue_clear(libsrpc_shmem_pid_t *pi)
-{
-  Request req;
-  
-  while(mpmc_queue_try_dequeue(&pi->queue, &req)) {
-    //!!! libsrpc_shmem_free(req.value);
-  }
-}
-
-int srpc_thread_rcv_req_stop(void) {
-  int rc = 0;
-  libsrpc_shmem_pid_t *pi = simplerpc_data->pid_info;
-  int n = atomic_load(&pi->threads_wait) + 1;
-
-  atomic_store(&srpc_thread_stop_flag, 1);
-
-  for(int i = 0; i < n; i++) {
-    sem_post(&simplerpc_data->pid_info->sem);
-  }
-
-  // Очищаем очередь запросов.
-  srpc_thread_rcv_queue_clear(pi);
-
-  // Ждём пока все потоки завершатся.
-  while(pi->threads_wait > 0) {
-    usleep(100);
-  }
-  
-  DBG_PRINT("srpc_thread_rcv_req_stop: send stopped\n");
-  return(rc);
-}
-
 /* ============================================================================== */
 void spawn_daemon(const char *daemon_name);
 extern char *program_invocation_name;

@@ -31,6 +31,9 @@ int main(int ac, char *av[])
         log_write(str);
     }
 
+    int result = calc_add(1, 2);
+    printf("calc_add: %d\n", result);
+
     printf("!!! end app !!!\n");
     //sleep(1);
     libsrpc_shmem_free(str);

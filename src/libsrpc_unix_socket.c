@@ -160,18 +160,28 @@ int libsrpc_unix_server_addclient(libsrpc_server_t *srv, int sck)
     ed->pid = cred.pid;
     ed->func = libsrpc_unix_client_worker;
 
-    libsrpc_shmem_reg_pid(ed->pid);
+    rc = libsrpc_shmem_reg_pid(ed->pid);
     if(rc < 0) {
         ERR_PRINT("unix_server: libsrpc_shmem_reg_pid failed\n");
         goto err;
     }
 
-    if(srv->pshm_fd) rc = send_fd(sck, *srv->pshm_fd);
+    if(srv->pshm_fd) {
+        rc = send_fd(sck, *srv->pshm_fd);
+        if(rc < 0) {
+            ERR_PRINT("unix_server: send_fd failed\n");
+            goto err;
+        }
+    }
 
     ev.events = ed->events;
     ev.data.ptr = ed;
 
     rc = epoll_ctl(ed->epfd, EPOLL_CTL_ADD, ed->socket, &ev);
+    if(rc < 0) {
+        ERR_PRINT("unix_server: epoll_ctl failed\n");
+        goto err;
+    }
 
     srv->clients++;
 
@@ -365,7 +375,7 @@ static int libsrpc_unix_socket_client_create(const char *name)
     for(int i = 0; i < 10000; i++) {
         rc = connect(sck, (struct sockaddr*)&addr, len);
         if(rc < 0) {
-            if(errno == ECONNREFUSED) { usleep(10000); continue; }
+            if(errno == ECONNREFUSED) { usleep(100); continue; }
         }
         break;
     }

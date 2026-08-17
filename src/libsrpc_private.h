@@ -8,6 +8,26 @@
 #include "libsrpc_mpmcq.h"
 
 /* ------------------------------------------------------------------------------ */
+
+/* Определение идентификаторов RPC функций */
+enum e_sRPCFNID {
+    sRPCFNID_START = 16,
+    #define XF(rettype,name,...)   sRPCFNID_##name,
+        RPC_LIST
+    #undef XF
+    sRPCFNID_MAX
+};
+
+/* ------------------------------------------------------------------------------ */
+
+/* Макросы для преобразований */
+#define GET_FNID(name)  sRPCFNID_##name
+#define sRPCFN(name)    librpcimp_##name
+#define sRPC_FNNUM      (sRPCFNID_MAX - sRPCFNID_START - 1)
+#define sRPC_IDX2ID(idx)   ((idx) + sRPCFNID_START + 1)
+#define sRPC_ID2IDX(id)   ((id) - sRPCFNID_START - 1)
+
+/* ------------------------------------------------------------------------------ */
 /*
 typedef struct srpc_pid_s {
     pid_t pid;

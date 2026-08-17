@@ -4,10 +4,12 @@
 #include <unistd.h>
 #include <errno.h>
 
-#include "../src/libsrpc.h"
+#include "libsrpc.h"
+
+int sched_getcpu(void);
 
 void log_write(const char* msg) {
-    fprintf(stderr, "LOG(%p): '%s'\n", (void*)msg, msg);
+    fprintf(stderr, "LOG(%p)[%02d]: '%s'\n", (void*)msg, sched_getcpu(), msg);
 }
 
 

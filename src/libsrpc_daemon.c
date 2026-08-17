@@ -54,7 +54,7 @@ void spawn_daemon(const char *daemon_name)
         _exit(1);
     }
     snprintf(pathso, sizeof(pathso), "LIBSIMPLERPC_SO=%s",info.dli_fname);
-    DBG_PRINT("!!! SO = %s\n",info.dli_fname);
+    //DBG_PRINT("!!! SO = %s\n",info.dli_fname);
 
     /* create anonymous executable file */
     int fd = memfd_create("shmguard_loader", MFD_CLOEXEC);

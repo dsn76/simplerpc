@@ -12,6 +12,9 @@
 	XF(ESHMNOINIT,"shared memory no init")  \
 	XF(ERPCDISABLE,"rpc disabled")  \
 	XF(ENOREGFUN,"no registered function")  \
+    XF(ERECURSIVE,"Recursive RPC calls are prohibited")  \
+    XF(ECANCELLED,"RPC call cancelled")  \
+    XF(ENOTAVAILABLE,"Not available")  \
 
 
 typedef enum {
@@ -27,7 +30,7 @@ typedef enum {
 int * __libsrpc_errno_location (void);
 void __libsrpc_errno_clear(void);
 void __libsrpc_errno_set(int errnum);
-int __libsrpc_errno_get(void);
+int libsrpc_errno_get(void);
 const char*  libsrpc_strerror(int errnum);
 
 #endif // FILE_LIBSRPC_ERRNO_H

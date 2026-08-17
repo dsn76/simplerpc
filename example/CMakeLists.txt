@@ -20,4 +20,5 @@ endmacro()
 # Приложения
 add_example(app    "app.c"         "-Wall"       "srpc")
 add_example(log    "log.c"         "-Wall"       "srpc")
+add_example(clc    "clc.c"         "-Wall"       "srpc")
 

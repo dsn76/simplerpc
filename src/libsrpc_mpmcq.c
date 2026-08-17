@@ -29,7 +29,7 @@ int mpmc_queue_try_enqueue(MpmcQueue *q, Request req) {
     MpmcCell *cell = NULL;
     do {
         pos = atomic_load_explicit(&q->enqueue_pos, memory_order_acquire);
-        MpmcCell *cell = &q->cells[pos & (MPMC_QUEUE_CAPACITY - 1)];
+        cell = &q->cells[pos & (MPMC_QUEUE_CAPACITY - 1)];
         uint64_t seq = atomic_load_explicit(&cell->sequence, memory_order_acquire);
         if (seq != pos) {
             // Ячейка занята – очередь заполнена

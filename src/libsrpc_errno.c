@@ -36,7 +36,7 @@ void __libsrpc_errno_set(int errnum)
     __libsrpc_errno = errnum;
 }
 
-int __libsrpc_errno_get(void)
+int libsrpc_errno_get(void)
 {
     return __libsrpc_errno;
 }
