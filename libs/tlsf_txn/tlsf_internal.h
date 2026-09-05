@@ -264,5 +264,12 @@ static inline int uid_count(const block_header_t *block)
     return count;
 }
 
+static inline int uid_get_first(const block_header_t *block)
+{
+    for (int i = 0; i < TLSF_MAX_OWNERS; i++) {
+        if (block->uid[i] != 0) return block->uid[i];
+    }
+    return 0;
+}
 
 #endif /* TLSF_INTERNAL_H */

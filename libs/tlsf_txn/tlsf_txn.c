@@ -1038,13 +1038,19 @@ int tlsf_free_uid_blocks(tlsf_t tlsf, uint16_t uid,
 
             bool match = (uid == 0) ? get_dc(block) : (uid_find(block, uid) >= 0);
             if (match) {
-                found = true;
-                int drc = destructor(tlsf, ptr_from_block(block), block, uid, user);
+                uint16_t uid_block = uid;
+                if(uid_block == 0) {
+                    uid_block = uid_get_first(block);
+                }
+                int drc = destructor(tlsf, ptr_from_block(block), block, uid_block, user);
                 if (drc < 0) {
                     pthread_mutex_unlock(&tlsf->mutex);
                     return drc;
                 }
-                break; /* не продолжать по старым смещениям */
+                if(drc > 0) { /* Деструктор что-то удалил. */
+                    found = true;
+                    break; /* не продолжать по старым смещениям */
+                }
             }
 
             block = (block_header_t *)((char *)block + bsz);
