@@ -12,57 +12,14 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
+#include <tlsf_txn.h>
+
 #include "libsrpc_local.h"
 #include "libsrpc_errno.h"
 #include "libsrpc_shmem.h"
 #include "libsrpc_mpmcq.h"
+#include "libsrpc_shm_gc.h"
 
-
-#define TLSF_BUL (1)
-#include <tlsf.h>
-
-
-static int robust_mutex_init(libsrpc_shmem_t *shm)
-{
-    pthread_mutex_t *mutex = &shm->mutex;
-
-    pthread_mutexattr_t attr;
-
-    pthread_mutexattr_init(&attr);
-
-    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
-    pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
-    pthread_mutex_init(mutex, &attr);
-
-    pthread_mutexattr_destroy(&attr);
-
-    return(0);
-}
-
-static int robust_mutex_destroy(libsrpc_shmem_t *shm)
-{
-    pthread_mutex_t *mutex = &shm->mutex;
-    return pthread_mutex_destroy(mutex);
-}
-
-static int robust_mutex_lock(libsrpc_shmem_t *shm)
-{
-    pthread_mutex_t *mutex = &shm->mutex;
-    int rc = pthread_mutex_lock(mutex);
-    if (rc == EOWNERDEAD) {
-        shm->cnt_errownerdead++;
-        rc = tlsf_bul_recover(shm->poolptr);
-        ERR_PRINT("Owner died. Recover mutex.\n");
-        pthread_mutex_consistent(mutex);
-    }
-    return(rc);
-}
-
-static int robust_mutex_unlock(libsrpc_shmem_t *shm)
-{
-    pthread_mutex_t *mutex = &shm->mutex;
-    return pthread_mutex_unlock(mutex);
-}
 
 int libsrpc_shmem_create(libsrpc_shmem_pool_t *pool, char *name, size_t size, uintptr_t virtaddr)
 {
@@ -75,13 +32,13 @@ int libsrpc_shmem_create(libsrpc_shmem_pool_t *pool, char *name, size_t size, ui
 
     if (pool->shm_fd < 0) {
         rc = -errno;
-        ERR_PRINT("libsrpc_shmem_create: shm_open failed: %s\n", strerror(errno));
+        ERR_PRINT("shm_open failed: %s\n", strerror(errno));
         goto err;
     }
 
     if (ftruncate(pool->shm_fd, size) < 0) {
         rc = -errno;
-        ERR_PRINT("libsrpc_shmem_create: ftruncate failed: %s\n", strerror(errno));
+        ERR_PRINT("ftruncate failed: %s\n", strerror(errno));
         goto err;
     }
 
@@ -91,32 +48,41 @@ int libsrpc_shmem_create(libsrpc_shmem_pool_t *pool, char *name, size_t size, ui
     if (pool->shm == MAP_FAILED) {
         pool->shm = NULL;
         rc = -errno;
-        ERR_PRINT("libsrpc_shmem_create: mmap failed: %s\n", strerror(errno));
+        ERR_PRINT("mmap failed: %s\n", strerror(errno));
         goto err;
     }
 
     // Запрещаем наследование при fork
     rc = madvise(pool->shm, size, MADV_DONTFORK);
     if (rc != 0) {
-        ERR_PRINT("libsrpc_shmem_create: madvise failed: %s\n", strerror(errno));
+        ERR_PRINT("madvise failed: %s\n", strerror(errno));
        goto err;
     }
-
+DBG_PRINT("INIT shm\n");
     memset(pool->shm, 0, size); // инициализируем память нулями
     pool->shm->basevadr = virtaddr;
     pool->shm->shmsize = size;
     strncpy(pool->shm->sign, name, sizeof(pool->shm->sign)-1);
 
+DBG_PRINT("INIT mempool in shm\n");
     pool->shm->poolsize = pool->shm->shmsize - sizeof(*pool->shm);
-    init_memory_pool(pool->shm->poolsize, pool->shm->poolptr);
-
-    robust_mutex_init(pool->shm);
-    rc = list_init(&pool->shm->reg_pid_list, 0);
-    DBG_PRINT("!!!! libsrpc_shmem_create: reg_pid_list init rc=%d\n", rc);
-    if(rc < 0) {
-        ERR_PRINT("libsrpc_shmem_create: list_init failed\n");
+    DBG_PRINT("INIT mempool in shm size=%zu\n", pool->shm->poolsize);
+    tlsf_t tlsf = tlsf_create(pool->shm->poolptr, pool->shm->poolsize);
+    DBG_PRINT("tlsf_create =%d\n",tlsf_get_errno(tlsf));
+    if(!tlsf) {
+        rc = -ENOMEM;
+        ERR_PRINT("tlsf_create failed\n");
         goto err;
     }
+
+DBG_PRINT("INIT proc list\n");
+    rc = libsrpc_list_head_init(&pool->shm->proc_head);
+    if(rc < 0) {
+        ERR_PRINT("libsrpc_list_head_init failed rc=%d\n", rc);
+        goto err;
+    }
+
+    libsrpc_shm_gc_init();
 
 end:
     return(rc);
@@ -141,7 +107,7 @@ int libsrpc_shmem_open(libsrpc_shmem_pool_t *pool, int shm_fd, uintptr_t virtadd
 
     size = st.st_size;
 
-    shm = mmap( (void*)virtaddr, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    shm = mmap( (void*)virtaddr, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED_NOREPLACE, shm_fd, 0);
     if (shm == MAP_FAILED) {
         shm = NULL;
         rc = -errno;
@@ -178,152 +144,155 @@ int libsrpc_shmem_destroy(libsrpc_shmem_pool_t *pool)
 {
     int rc = 0;
 
-    robust_mutex_destroy(pool->shm);
-    rc = list_destroy(&pool->shm->reg_pid_list);
+    libsrpc_shm_gc_destroy();
+
+    rc = libsrpc_list_head_destroy(&pool->shm->proc_head);
     if(rc < 0) {
-        ERR_PRINT("libsrpc_shmem_destroy: list_destroy failed\n");
+        ERR_PRINT("libsrpc_list_head_destroy failed rc=%d\n", rc);
     }
 
-    destroy_memory_pool(pool->shm->poolptr);
+    tlsf_destroy((tlsf_t)pool->shm->poolptr);
 
     rc = munmap(pool->shm, pool->shm->shmsize);
+    if(rc < 0) {
+        ERR_PRINT("munmap failed rc=%d\n", rc);
+    }
 
     close(pool->shm_fd);
 
     return(rc);
 }
 
-void* libsrpc_shmem_malloc(size_t size)
+libsrpc_shmem_t * libsrpc_shmem_get(void)
 {
-    int rc = 0;
+    libsrpc_shmem_t *shm = NULL;
+
+    if(!simplerpc_data || !simplerpc_data->shmempool.shm) return(NULL);
+    shm = simplerpc_data->shmempool.shm;
+    return shm;
+}
+
+/* ------------------------------------------------------------------------------ */
+/* Выделение памяти в разделяемой памяти */
+/* ------------------------------------------------------------------------------ */
+void* libsrpc_shmem_malloc_type(size_t size, libsrpc_shm_data_type_t type)
+{
     void *ptr = NULL;
-    libsrpc_shmem_t *shm;
+    libsrpc_shmem_t *shm = libsrpc_shmem_get();
+    uint16_t uid;
 
     if(!simplerpc_data) {
         __libsrpc_errno_set(ELIBNOINIT);
         goto end;
     }
-    if(!simplerpc_data->shmempool.shm) {
+    uid = simplerpc_data->proc_uid;
+
+    if(!shm) {
         __libsrpc_errno_set(ESHMNOINIT);
         goto end;
     }
 
-    shm = simplerpc_data->shmempool.shm;
+    ptr = tlsf_malloc((tlsf_t)shm->poolptr, size, uid, type);
+    __libsrpc_errno_set(tlsf_get_errno((tlsf_t)shm->poolptr));
 
-    rc = robust_mutex_lock(shm);
-    if(rc < 0) {
-        __libsrpc_errno_set(rc);
+end:
+    return(ptr);
+}
+
+void* libsrpc_shmem_malloc(size_t size)
+{
+    return libsrpc_shmem_malloc_type(size, LIBSRPC_SHMDT_USER);
+}
+
+void* libsrpc_shmem_calloc_type(size_t num, size_t size, libsrpc_shm_data_type_t type)
+{
+    void *ptr = NULL;
+    libsrpc_shmem_t *shm = libsrpc_shmem_get();
+    uint16_t uid;
+
+    if(!simplerpc_data) {
+        __libsrpc_errno_set(ELIBNOINIT);
+        goto end;
+    }
+    uid = simplerpc_data->proc_uid;
+
+    if(!shm) {
+        __libsrpc_errno_set(ESHMNOINIT);
         goto end;
     }
 
-    ptr = malloc_ex(size, shm->poolptr);
+    ptr= tlsf_calloc((tlsf_t)shm->poolptr, num, size, uid, type);
+    __libsrpc_errno_set(tlsf_get_errno((tlsf_t)shm->poolptr));
 
-    rc = robust_mutex_unlock(shm);
-    if(rc < 0) {
-        __libsrpc_errno_set(rc);
-        goto end;
-    }
 end:
     return(ptr);
 }
 
 void* libsrpc_shmem_calloc(size_t num, size_t size)
 {
-    void *ptr = NULL;
-    int rc = 0;
-    libsrpc_shmem_t *shm;
-
-    if(!simplerpc_data) {
-        __libsrpc_errno_set(ELIBNOINIT);
-        goto end;
-    }
-    if(!simplerpc_data->shmempool.shm) {
-        __libsrpc_errno_set(ESHMNOINIT);
-        goto end;
-    }
-
-    shm = simplerpc_data->shmempool.shm;
-
-    rc = robust_mutex_lock(shm);
-    if(rc < 0) {
-        __libsrpc_errno_set(rc);
-        goto end;
-    }
-
-    ptr = calloc_ex(num, size, shm->poolptr);
-
-    rc = robust_mutex_unlock(shm);
-    if(rc < 0) {
-        __libsrpc_errno_set(rc);
-        goto end;
-    }
-end:
-    return(ptr);
+    return libsrpc_shmem_calloc_type(num, size, LIBSRPC_SHMDT_USER);
 }
 
 void* libsrpc_shmem_realloc(void* ptr, size_t newsize)
 {
     void *nptr = NULL;
-    int rc = 0;
-    libsrpc_shmem_t *shm;
+    libsrpc_shmem_t *shm = libsrpc_shmem_get();
+    uint16_t uid;
 
     if(!simplerpc_data) {
         __libsrpc_errno_set(ELIBNOINIT);
         goto end;
     }
-    if(!simplerpc_data->shmempool.shm) {
+    uid = simplerpc_data->proc_uid;
+
+    if(!shm) {
         __libsrpc_errno_set(ESHMNOINIT);
         goto end;
     }
 
-    shm = simplerpc_data->shmempool.shm;
+    nptr = tlsf_realloc((tlsf_t)shm->poolptr, ptr, newsize, uid);
+    __libsrpc_errno_set(tlsf_get_errno((tlsf_t)shm->poolptr));
 
-    rc = robust_mutex_lock(shm);
-    if(rc < 0) {
-        __libsrpc_errno_set(rc);
-        goto end;
-    }
-
-    nptr = realloc_ex(ptr, newsize, shm->poolptr);
-
-    rc = robust_mutex_unlock(shm);
-    if(rc < 0) {
-        __libsrpc_errno_set(rc);
-        goto end;
-    }
 end:
     return(nptr);
 }
 
 void libsrpc_shmem_free(void *ptr)
 {
-    int rc = 0;
-    libsrpc_shmem_t *shm;
+    libsrpc_shmem_t *shm = libsrpc_shmem_get();
+    uint16_t uid;
 
     if(!simplerpc_data) {
         __libsrpc_errno_set(ELIBNOINIT);
         goto end;
     }
-    if(!simplerpc_data->shmempool.shm) {
+    uid = simplerpc_data->proc_uid;
+
+    if(!shm) {
         __libsrpc_errno_set(ESHMNOINIT);
         goto end;
     }
 
-    shm = simplerpc_data->shmempool.shm;
+    tlsf_free((tlsf_t)shm->poolptr, ptr, uid);
+    __libsrpc_errno_set(tlsf_get_errno((tlsf_t)shm->poolptr));
 
-    rc = robust_mutex_lock(shm);
-    if(rc < 0) {
-        __libsrpc_errno_set(rc);
+end:
+    return;
+}
+
+void  libsrpc_shmem_free_dc(void *ptr)
+{
+    libsrpc_shmem_t *shm = libsrpc_shmem_get();
+    int rc = 0;
+
+    if(!shm) {
+        __libsrpc_errno_set(ESHMNOINIT);
         goto end;
     }
 
-    free_ex(ptr, shm->poolptr);
+    rc = tlsf_setdc((tlsf_t)shm->poolptr, ptr);
+    __libsrpc_errno_set(rc);
 
-    rc = robust_mutex_unlock(shm);
-    if(rc < 0) {
-        __libsrpc_errno_set(rc);
-        goto end;
-    }
 end:
     return;
 }
@@ -331,19 +300,13 @@ end:
 int libsrpc_shmem_link(void *ptr)
 {
     int rc;
-    libsrpc_shmem_t *shm;
+    libsrpc_shmem_t *shm = libsrpc_shmem_get();
+    uint16_t uid;
 
-    if(!ptr || !simplerpc_data || !simplerpc_data->shmempool.shm) return(-EINVAL);
-    shm = simplerpc_data->shmempool.shm;
+    if(!ptr || !simplerpc_data || !shm) return(-EINVAL);
+    uid = simplerpc_data->proc_uid;
 
-    rc = robust_mutex_lock(shm);
-    if(rc < 0) {
-        __libsrpc_errno_set(rc);
-        goto end;
-    }
-    rc = tlsf_link(ptr, shm->poolptr);
-
-    rc = robust_mutex_unlock(shm);
+    rc = tlsf_link((tlsf_t)shm->poolptr, ptr, uid);
 
     if(rc < 0) {
         __libsrpc_errno_set(rc);
@@ -351,91 +314,5 @@ int libsrpc_shmem_link(void *ptr)
     }
 end:
     return(rc);
-}
-
-/* ------------------------------------------------------------------------------ */
-/* Регистрация процессов в разделяемой памяти */
-/* ------------------------------------------------------------------------------ */
-int libsrpc_shmem_reg_pid(pid_t pid)
-{
-    int rc = 0;
-    libsrpc_shmem_pid_t *pid_info;
-    libsrpc_shmem_t *shm = simplerpc_data->shmempool.shm;
-
-    pid_info = libsrpc_shmem_get_reg_pid(pid);
-    if(pid_info) {
-        DBG_PRINT("pid=%d already registered\n", pid);
-        return(0);
-    }
-
-    pid_info = libsrpc_shmem_malloc(sizeof(libsrpc_shmem_pid_t));
-    if(!pid_info) {
-        rc = -ENOMEM;
-        ERR_PRINT("malloc failed\n");
-        goto err;
-    }
-
-    memset(pid_info, 0, sizeof(libsrpc_shmem_pid_t));
-    pid_info->pid = pid;
-
-    rc = sem_init(&pid_info->sem, 1, 0);
-    if(rc < 0) {
-        ERR_PRINT("sem_init failed: %s\n", strerror(rc));
-        goto err;
-    }
-
-    mpmc_queue_init(&pid_info->queue);
-
-    rc = list_add_tail(&shm->reg_pid_list, &pid_info->list);
-    if(rc < 0) {
-        ERR_PRINT("dlist_push_front failed: %s\n", strerror(rc));
-        goto err;
-    }
-    DBG_PRINT("pid=%d registered pid_info=%p\n", pid, pid_info);
-end:
-    return(rc);
-err:
-    if(pid_info) libsrpc_shmem_free(pid_info);
-    goto end;
-}
-
-int libsrpc_shmem_unreg_pid(pid_t pid)
-{
-    int rc = 0;
-    libsrpc_shmem_pid_t *pid_info = NULL;
-    libsrpc_shmem_t *shm = simplerpc_data->shmempool.shm;
-
-    pid_info = libsrpc_shmem_get_reg_pid(pid);
-    if(pid_info) {
-        sem_destroy(&pid_info->sem);
-        srpc_thread_rcv_queue_clear(pid_info);
-        list_remove(&shm->reg_pid_list, &pid_info->list);
-        libsrpc_shmem_free(pid_info);
-    }
-    DBG_PRINT("pid=%d unregistered pid_info=%p\n", pid, pid_info);
-    return(rc);
-}
-
-/* Отсутствуют блокировки и счётчик ссылок, потому что эта функция вызывается только регистрируемым процессов и демоном.
- * Если процесс упадёт, то демоно зачистит разделяемую память и освободит все ресурсы.
- * Если нужно другое поведение, то нужно добавить блокировки или счётчик ссылок. */
-libsrpc_shmem_pid_t* libsrpc_shmem_get_reg_pid(pid_t pid)
-{
-    libsrpc_shmem_pid_t *pid_info = NULL;
-    libsrpc_shmem_t *shm = simplerpc_data->shmempool.shm;
-
-    int rc = list_lock(&shm->reg_pid_list);
-    if (rc == 0) {
-        libsrpc_shmem_pid_t *it;
-        LIST_FOREACH_ENTRY(&shm->reg_pid_list, it, list, libsrpc_shmem_pid_t) {
-            if(pid == it->pid) {
-                pid_info = it;
-                break;
-            }
-        }
-    list_unlock(&shm->reg_pid_list);
-    }
-    DBG_PRINT("pid=%d get registered pid_info=%p\n", pid, pid_info);
-    return(pid_info);
 }
 

@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-#include "libsrpc_futex.h"
+#include "libsrpc_wrapper.h"
 
 struct epoll_event;
 typedef struct libsrpc_epoll_s libsrpc_epoll_t;
@@ -38,7 +38,7 @@ typedef struct libsrpc_client_s {
     int efd_exit; // eventfd for exit
     const char *sck_name;
     pid_t pid;
-    job_futex_t jf; // futex для синхронизации состояния.
+    libsrpc_sem_t sem_status; // семафор для синхронизации состояния.
 } libsrpc_client_t;
 
 int libsrpc_unix_server_init(libsrpc_server_t *srv, const char *name);

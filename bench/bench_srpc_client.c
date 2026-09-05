@@ -152,5 +152,10 @@ int main(int ac, char **av)
     bench_report(label, all, total, wall1 - wall0);
 
     printf("bench_srpc_client: успешных RPC=%zu\n", ok + total);
+    free(s);
+    free(all);
+    free(tid);
+    for (size_t t = 0; t < nthreads; t++) free(ctx[t].samples);
+    free(ctx);
     return 0;
 }

@@ -1,4 +1,0 @@
-[submodule "libs/tlsf"]
-	path = libs/tlsf
-	url = https://github.com/dsn76/tlsf
-	branch = bul

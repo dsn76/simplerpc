@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <stdatomic.h>
 
 #include "libsrpc.h"
 
@@ -20,11 +21,24 @@ int calc_add(int a, int b) {
     return a + b;
 }
 
+atomic_int_least32_t exit_flag = 0;
 
-int main(int ac, char **av) {
+void all_exit(void) {
+    atomic_store_explicit(&exit_flag, 1, memory_order_release);
+}
+
+int main(int ac, char **av)
+{
+    usleep(1000);
+
     print_log("CACL START");
-    sleep(60);
+
+    while (!atomic_load_explicit(&exit_flag, memory_order_acquire)) {
+        usleep(1000);
+    }
+
     print_log("CALC END");
+
     return 0;
 }
 

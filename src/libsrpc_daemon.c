@@ -23,6 +23,8 @@
 #include "libsrpc_local.h"
 #include "embedded_loader.h"
 
+#include "libsrpc_proc.h"
+
 #include "libsrpc_daemon.h"
 
 #define ABSTRACT_SOCK_NAME "libsrpc_guard"
@@ -30,6 +32,7 @@
 
 void spawn_daemon(const char *daemon_name)
 {
+    int rc;
     char pathso[PATH_MAX + 32];
 
     pid_t pid = fork();
@@ -54,7 +57,7 @@ void spawn_daemon(const char *daemon_name)
         _exit(1);
     }
     snprintf(pathso, sizeof(pathso), "LIBSIMPLERPC_SO=%s",info.dli_fname);
-    //DBG_PRINT("!!! SO = %s\n",info.dli_fname);
+    DBG_PRINT("!!! SO = %s\n",info.dli_fname);
 
     /* create anonymous executable file */
     int fd = memfd_create("shmguard_loader", MFD_CLOEXEC);
@@ -65,7 +68,10 @@ void spawn_daemon(const char *daemon_name)
     }
     lseek(fd, 0, SEEK_SET);
     /* executable permission */
-    fchmod(fd, 0700);
+    rc = fchmod(fd, 0700);
+    if(rc < 0) {
+        WRN_PRINT("fchmod failed: %s\n", strerror(errno));
+    }
 
     /* execute directly from RAM */
     //char* const argv[] = { (char*)"[shmguardd]", NULL };
@@ -77,27 +83,29 @@ void spawn_daemon(const char *daemon_name)
 }
 
 
-int simplerpc_daemon_main(int ac, char *av[])
+int simplerpc_daemon_main(int ac __attribute__((unused)), char *av[])
 {
     int rc;
     char *daemon_name = av[0];
 
-    DBG_PRINT("simplerpc_daemon_main() '%s'\n",daemon_name);
+    DBG_PRINT("START daemon = '%s'\n",daemon_name);
 
     simplerpc_data->is_daemon = true;
+    simplerpc_data->proc_uid = DAEMON_PROC_UID;
 
+DBG_PRINT("INIT server\n");
     /* Инициализируем сервер Unix сокетов. */
     rc = libsrpc_unix_server_init(&simplerpc_data->srv, daemon_name);
     if(rc < 0) goto err_init;
-
+DBG_PRINT("INIT shmem\n");
     /* Инициализируем разделяемую память. */
     rc = libsrpc_shmem_create(&simplerpc_data->shmempool, daemon_name, SHMEM_SIZE, SHMEM_BASE_VADR);
     if(rc < 0) goto err_init;
-
+DBG_PRINT("INIT pshm_fd\n");
     simplerpc_data->srv.pshm_fd = &simplerpc_data->shmempool.shm_fd;
 
     /* Ждём клиентов. */
-    DBG_PRINT("simplerpc_daemon_main() wait for clients\n");
+    DBG_PRINT("WAIT for clients\n");
     while(1) {
         rc = libsrpc_unix_server_epoll_wait(&simplerpc_data->srv, 1000);
         if(rc < 0) break;
@@ -110,10 +118,10 @@ int simplerpc_daemon_main(int ac, char *av[])
 end:
     /* Уничтожаем разделяемую память. */
     if(simplerpc_data->shmempool.shm_fd > 0) libsrpc_shmem_destroy(&simplerpc_data->shmempool);
-    DBG_PRINT("simplerpc_daemon_main() exit\n");
+    DBG_PRINT("EXIT\n");
     return rc;
 err_init:
-    DBG_PRINT("simplerpc_daemon_main() error: '%s'\n", strerror(-rc));
+    DBG_PRINT("Error: %s\n", strerror(-rc));
     goto end;
 }
 

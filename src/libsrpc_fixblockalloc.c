@@ -9,9 +9,10 @@
 srpc_pool_fba_t * srpc_pool_create(size_t elm_num, size_t elm_size)
 {
     srpc_pool_fba_t *pool = NULL;
+    size_t blk_size = (elm_size + 15) / 16 * 16;
     size_t fifo_size = (elm_num + 1) * sizeof(pool->fifo[0]);
-    size_t pool_size = elm_size * elm_num + sizeof(*pool) + fifo_size;
-    fifo_size = (fifo_size * 64ULL + 64ULL - 1ULL) / 64ULL;
+    fifo_size = (fifo_size + 63) / 64 * 64;
+    size_t pool_size = blk_size * elm_num + sizeof(*pool) + fifo_size;
 
     pool = malloc(pool_size);
     if(!pool) goto end;
@@ -20,10 +21,10 @@ srpc_pool_fba_t * srpc_pool_create(size_t elm_num, size_t elm_size)
 
     pool->pool_size = pool_size;
     pool->blk_nums = elm_num;
-    pool->blk_size = elm_size;
+    pool->blk_size = blk_size;
     pool->offset = fifo_size;
 
-    for(int i = 0; i < elm_num; i++){
+    for(size_t i = 0; i < elm_num; i++){
         pool->fifo[pool->free++] = i;
     }
 
@@ -35,10 +36,9 @@ end:
 int srpc_pool_destroy(srpc_pool_fba_t *pool)
 {
     int rc = 0;
-    void *ptr;
 
     while(pool) {
-        ptr = pool;
+        void *ptr = pool;
         pool = pool->nextpool;
         free(ptr);
     }
@@ -67,7 +67,7 @@ void * srpc_pool_alloc(srpc_pool_fba_t *pool)
     blk = pool->fifo[oi];
     pool->alloc = ni;
 
-    ptr =  (void*)pool + pool->offset + ((uintptr_t)blk * (uintptr_t)pool->blk_size);
+    ptr =  (char*)pool + pool->offset + ((uintptr_t)blk * (uintptr_t)pool->blk_size);
 
 end:
     return(ptr);

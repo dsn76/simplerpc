@@ -24,7 +24,7 @@ void mpmc_queue_enqueue(MpmcQueue *q, Request req) {
     atomic_store_explicit(&cell->sequence, pos + 1, memory_order_release);
 }
 
-int mpmc_queue_try_enqueue(MpmcQueue *q, Request req) {
+int mpmc_queue_try_enqueue(MpmcQueue *q, Request req, Request **preq) {
     uint64_t pos = 0;
     MpmcCell *cell = NULL;
     do {
@@ -47,6 +47,7 @@ int mpmc_queue_try_enqueue(MpmcQueue *q, Request req) {
     cell = &q->cells[pos & (MPMC_QUEUE_CAPACITY - 1)];
     cell->data = req;
     atomic_store_explicit(&cell->sequence, pos + 1, memory_order_release);
+    if(preq) *preq = &cell->data; // возвращаем указатель на запрос
     return 1;
 }
 

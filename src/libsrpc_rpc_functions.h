@@ -3,15 +3,13 @@
 
 
 /* Список объявлений прототипов RPC функций с параметрами, которые будут использоваться для удаленного вызова.
- * XF(возвращаемый тип, имя функции, параметры)
+ * XF(флаг отправки, возвращаемый тип, имя функции, параметры)
  * Функции с переменным числом параметров - не допустимы.
  */
 #define RPC_LIST    \
-    XF(int,testrpc0)  \
-    XF(void,testrpc1,int,char*,long) \
-    XF(int,testlocal) \
-    XF(void,log_write,const char*) \
-    XF(int,calc_add,int,int) \
-
+    XF(RPC_SEND_ALL, int,testlocal) \
+    XF(RPC_SEND_ALL, pid_t,log_write,const char*) \
+    XF(RPC_SEND_ALL, int,calc_add,int,int) \
+    XF(RPC_SEND_ALL, void,all_exit) \
 
 #endif // FILE_LIBSRPC_RPC_FUNCTIONS_H

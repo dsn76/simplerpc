@@ -43,7 +43,7 @@ int libsrpc_errno_get(void)
 
 const char*  libsrpc_strerror(int errnum)
 {
-    const char *unk = "Unknown error code";
+    static const char *unk = "Unknown error code";
     if(errnum <= ELIBSRPC_START) return(strerror(errnum));
     if(errnum >= LIBSRPC_ERRNO_MAX) return(unk);
     return(errno2str[errnum - ELIBSRPC_START].str);

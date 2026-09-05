@@ -24,7 +24,10 @@ int main(int ac, char *av[])
 
     daemon_fn_t fn = (daemon_fn_t)dlsym( h, "simplerpc_daemon_main");
 
-    if (!fn) return 1;
+    if (!fn) {
+        dlclose(h);
+        return 1;
+    }
 
     ret = fn(ac, av);
 

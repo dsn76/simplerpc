@@ -12,7 +12,7 @@
 #include <sys/resource.h>
 
 #ifndef PTHREAD_STACK_MIN
-#define PTHREAD_STACK_MIN 16384
+#define PTHREAD_STACK_MIN (16384UL)
 #endif
 
 typedef struct start_ctx_s {
@@ -58,13 +58,13 @@ static void *start_thunk(void *arg)
 int pthread_start(thread_func_t func, void *arg, thread_flag_t flags)
 {
     if (func == NULL) {
-        ERR_PRINT("pthread_start: func is NULL\n");
+        ERR_PRINT("func is NULL\n");
         return -EINVAL;
     }
 
     if ((flags.flags & THREAD_FLAG_NICE) &&
         (flags.nice_value < -20 || flags.nice_value > 19)) {
-        ERR_PRINT("pthread_start: nice value is out of range\n");
+        ERR_PRINT("nice value is out of range\n");
         return -EINVAL;
     }
 
@@ -72,7 +72,7 @@ int pthread_start(thread_func_t func, void *arg, thread_flag_t flags)
     int wants_detach = (flags.flags & THREAD_FLAG_DETACHED) != 0;
 
     if (wants_join && wants_detach) {
-        ERR_PRINT("pthread_start: wants_join and wants_detach are set\n");
+        ERR_PRINT("wants_join and wants_detach are set\n");
         return -EINVAL;
     }
 
@@ -81,7 +81,7 @@ int pthread_start(thread_func_t func, void *arg, thread_flag_t flags)
          * Для joinable-потока нужно куда-то вернуть pthread_t,
          * иначе pthread_join() будет невозможен.
          */
-        ERR_PRINT("pthread_start: wants_join and thread_out is NULL\n");
+        ERR_PRINT("wants_join and thread_out is NULL\n");
         return -EINVAL;
     }
 
@@ -103,7 +103,7 @@ int pthread_start(thread_func_t func, void *arg, thread_flag_t flags)
     pthread_attr_t attr;
     int rc = pthread_attr_init(&attr);
     if (rc != 0) {
-        ERR_PRINT("pthread_start: pthread_attr_init failed\n");
+        ERR_PRINT("pthread_attr_init failed\n");
         return -rc;
     }
 
@@ -112,7 +112,7 @@ int pthread_start(thread_func_t func, void *arg, thread_flag_t flags)
         detached ? PTHREAD_CREATE_DETACHED : PTHREAD_CREATE_JOINABLE
     );
     if (rc != 0) {
-        ERR_PRINT("pthread_start: pthread_attr_setdetachstate failed\n");
+        ERR_PRINT("pthread_attr_setdetachstate failed\n");
         goto out;
     }
 
@@ -124,19 +124,19 @@ int pthread_start(thread_func_t func, void *arg, thread_flag_t flags)
             flags.sched_priority < prio_min ||
             flags.sched_priority > prio_max) {
             rc = EINVAL;
-            ERR_PRINT("pthread_start: sched_get_priority_min or sched_get_priority_max failed\n");
+            ERR_PRINT("sched_get_priority_min or sched_get_priority_max failed\n");
             goto out;
         }
 
         rc = pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
         if (rc != 0) {
-            ERR_PRINT("pthread_start: pthread_attr_setinheritsched failed\n");
+            ERR_PRINT("pthread_attr_setinheritsched failed\n");
             goto out;
         }
 
         rc = pthread_attr_setschedpolicy(&attr, flags.sched_policy);
         if (rc != 0) {
-            ERR_PRINT("pthread_start: pthread_attr_setschedpolicy failed\n");
+            ERR_PRINT("pthread_attr_setschedpolicy failed\n");
             goto out;
         }
 
@@ -146,15 +146,15 @@ int pthread_start(thread_func_t func, void *arg, thread_flag_t flags)
 
         rc = pthread_attr_setschedparam(&attr, &sp);
         if (rc != 0) {
-            ERR_PRINT("pthread_start: pthread_attr_setschedparam failed\n");
+            ERR_PRINT("pthread_attr_setschedparam failed\n");
             goto out;
         }
     }
 
     if (flags.stack_addr != NULL || flags.stack_size != 0) {
-        if (flags.stack_size < PTHREAD_STACK_MIN) {
+        if (flags.stack_size < (size_t)PTHREAD_STACK_MIN) {
             rc = EINVAL;
-            ERR_PRINT("pthread_start: stack size is less than PTHREAD_STACK_MIN\n");
+            ERR_PRINT("stack size is less than PTHREAD_STACK_MIN\n");
             goto out;
         }
 
@@ -165,7 +165,7 @@ int pthread_start(thread_func_t func, void *arg, thread_flag_t flags)
         }
 
         if (rc != 0) {
-            ERR_PRINT("pthread_start: pthread_attr_setstack or pthread_attr_setstacksize failed\n");
+            ERR_PRINT("pthread_attr_setstack or pthread_attr_setstacksize failed\n");
             goto out;
         }
     }
@@ -173,7 +173,7 @@ int pthread_start(thread_func_t func, void *arg, thread_flag_t flags)
     if (flags.guard_size != 0) {
         rc = pthread_attr_setguardsize(&attr, flags.guard_size);
         if (rc != 0) {
-            ERR_PRINT("pthread_start: pthread_attr_setguardsize failed\n");
+            ERR_PRINT("pthread_attr_setguardsize failed\n");
             goto out;
         }
     }
@@ -185,7 +185,7 @@ int pthread_start(thread_func_t func, void *arg, thread_flag_t flags)
 
         rc = pthread_attr_setaffinity_np(&attr, sz,  (const cpu_set_t *)flags.cpuset );
         if (rc != 0) {
-            ERR_PRINT("pthread_start: pthread_attr_setaffinity_np failed sz=%zu/%zu rc=%d err=%s\n", sz, sizeof(cpu_set_t), rc, strerror(rc));
+            ERR_PRINT("pthread_attr_setaffinity_np failed sz=%zu/%zu rc=%d err=%s\n", sz, sizeof(cpu_set_t), rc, strerror(rc));
             goto out;
         }
     }
@@ -196,7 +196,7 @@ int pthread_start(thread_func_t func, void *arg, thread_flag_t flags)
         name_copy = strdup(flags.name);
         if (name_copy == NULL) {
             rc = ENOMEM;
-            ERR_PRINT("pthread_start: strdup failed\n");
+            ERR_PRINT("strdup failed\n");
             goto out;
         }
     }
@@ -205,7 +205,7 @@ int pthread_start(thread_func_t func, void *arg, thread_flag_t flags)
     if (ctx == NULL) {
         free(name_copy);
         rc = ENOMEM;
-        ERR_PRINT("pthread_start: malloc failed\n");
+        ERR_PRINT("malloc failed\n");
         goto out;
     }
 
@@ -221,7 +221,7 @@ int pthread_start(thread_func_t func, void *arg, thread_flag_t flags)
     if (rc != 0) {
         free(name_copy);
         free(ctx);
-        ERR_PRINT("pthread_start: pthread_create failed\n");
+        ERR_PRINT("pthread_create failed\n");
         goto out;
     }
 
@@ -230,11 +230,9 @@ int pthread_start(thread_func_t func, void *arg, thread_flag_t flags)
     }
 
     rc = 0;
-    return rc;
-
 out:
     pthread_attr_destroy(&attr);
-    return -rc;
+    return rc != 0 ? rc : 0;
 }
 
 int pthread_start_all_cpu(thread_func_t func, void *arg)
@@ -248,13 +246,13 @@ int pthread_start_all_cpu(thread_func_t func, void *arg)
 
     rc = sched_getaffinity(0, sizeof(mask), &mask);
     if (rc != 0) {
-        ERR_PRINT("pthread_start_all_cpu: sched_getaffinity failed\n");
+        ERR_PRINT("sched_getaffinity failed\n");
         goto err;
     }
 
     int n = CPU_COUNT(&mask);
     if (n <= 0) {
-        ERR_PRINT("pthread_start_all_cpu: CPU_COUNT failed\n");
+        ERR_PRINT("CPU_COUNT failed\n");
         goto err;
     }
 
@@ -268,7 +266,7 @@ int pthread_start_all_cpu(thread_func_t func, void *arg)
             
             rc = pthread_start(func, arg, flags);
             if (rc != 0) {
-                ERR_PRINT("pthread_start_all_cpu: pthread_start failed CPU=%d  rc=%d\n", cpu, rc);
+                ERR_PRINT("pthread_start failed CPU=%d  rc=%d\n", cpu, rc);
                 goto err;
             }
         }

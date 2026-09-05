@@ -19,8 +19,79 @@
 #include "libsrpc_fixblockalloc.h"
 #include "libsrpc_pthread.h"
 #include "libsrpc_unix_socket.h"
+#include "libsrpc_proc.h"
 
+/* ============================================================================== */
+/* Реестр функций */
+typedef struct regfn_msg_s {
+    uint32_t        size; // Размер сообщения.
+    char            sign[32]; // Сигнатура.
+    srpc_bmp_func_t bmp; // Битовая карта функций.
+} regfn_msg_t;
 
+static int send_full(int sock, const void *buf, size_t len)
+{
+    const char *p = (const char *)buf;
+
+    while(len > 0) {
+        ssize_t w = send(sock, p, len, MSG_NOSIGNAL);
+        if(w < 0) {
+            if(errno == EINTR) continue;
+            return(-1);
+        }
+        p += w;
+        len -= (size_t)w;
+    }
+
+    return(0);
+}
+
+static int read_full(int sock, void *buf, size_t len)
+{
+    char *p = (char *)buf;
+
+    while(len > 0) {
+        ssize_t r = read(sock, p, len);
+        if(r < 0) {
+            if(errno == EINTR) continue;
+            return(-1);
+        }
+        if(r == 0) return(-1);
+        p += r;
+        len -= (size_t)r;
+    }
+
+    return(0);
+}
+
+static int send_msg_regfn(int sock)
+{
+    regfn_msg_t msg = {0};
+
+    msg.size = sizeof(msg);
+    strncpy(msg.sign, libsrpc_daemon_name, sizeof(msg.sign)-1);
+    libsrpc_bmp_func_set(&msg.bmp);
+
+    return send_full(sock, &msg, sizeof(msg));
+}
+
+static int read_msg_regfn(int sock, pid_t pid)
+{
+    regfn_msg_t msg = {0};
+    libsrpc_proc_t *proc = libsrpc_proc_get(pid);
+
+    if(!proc) return(-1);
+
+    if(read_full(sock, &msg, sizeof(msg)) < 0) return(-1);
+    if(msg.size != sizeof(msg)) return(-1);
+    if(strncmp(msg.sign, libsrpc_daemon_name, sizeof(msg.sign)) != 0) return(-1);
+    
+    libsrpc_reg_func_form_bmp(proc, &msg.bmp);
+
+    return(0);
+}
+
+/* ============================================================================== */
 static int libsrpc_epoll_create(void)
 {
     int epfd = epoll_create1(EPOLL_CLOEXEC);
@@ -54,7 +125,7 @@ static int libsrpc_unix_scoket_server_create(const char *name)
     addr.sun_family = AF_UNIX;
 
     /* abstract socket: first byte = '\0' */
-    strcpy(addr.sun_path + 1, name);
+    strncpy(addr.sun_path + 1, name, sizeof(addr.sun_path) - 2);
 
     socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(name);
 
@@ -106,7 +177,7 @@ static int send_fd(int sock, int fd_to_send)
     return sendmsg(sock, &msg, 0);
 }
 
-int libsrpc_unix_client_worker(libsrpc_server_t *srv, libsrpc_epoll_t *ed, struct epoll_event *ev)
+static int libsrpc_unix_client_worker(libsrpc_server_t *srv, libsrpc_epoll_t *ed, struct epoll_event *ev)
 {
     int rc = 0;
     ssize_t rl;
@@ -124,16 +195,16 @@ end:
     return(rc);
 close:
     srv->clients--;
-    DBG_PRINT("unix_server: client closed pid=%d clients=%d\n", ed->pid, srv->clients);
+    DBG_PRINT("client closed pid=%d clients=%d\n", ed->pid, srv->clients);
     epoll_ctl(srv->epfd, EPOLL_CTL_DEL, ed->socket, NULL);
     close(ed->socket);
     ed->socket = 0;
-    libsrpc_shmem_unreg_pid(ed->pid);
+    libsrpc_proc_destroy(ed->pid);
     srpc_pool_free(srv->pool_epcln, ed);
     goto end;
 }
 
-int libsrpc_unix_server_addclient(libsrpc_server_t *srv, int sck)
+static int libsrpc_unix_server_addclient(libsrpc_server_t *srv, int sck)
 {
     int rc = 0;
     struct ucred cred;
@@ -160,17 +231,28 @@ int libsrpc_unix_server_addclient(libsrpc_server_t *srv, int sck)
     ed->pid = cred.pid;
     ed->func = libsrpc_unix_client_worker;
 
-    rc = libsrpc_shmem_reg_pid(ed->pid);
+    rc = libsrpc_proc_create(ed->pid);
     if(rc < 0) {
-        ERR_PRINT("unix_server: libsrpc_shmem_reg_pid failed\n");
+        ERR_PRINT("libsrpc_proc_create failed\n");
         goto err;
     }
+
+    /* Сообщение регистрации читается до epoll; таймаут — чтобы демон не блокировался навсегда. */
+    struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+    setsockopt(sck, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    rc = read_msg_regfn(sck, ed->pid);
+    if(rc < 0) {
+        ERR_PRINT("read_reg_msg failed pid=%d\n", ed->pid);
+        goto err;
+    }
+    DBG_PRINT("unix_server: reg msg pid=%d\n", ed->pid);
 
     if(srv->pshm_fd) {
         rc = send_fd(sck, *srv->pshm_fd);
         if(rc < 0) {
-            ERR_PRINT("unix_server: send_fd failed\n");
-            goto err;
+            ERR_PRINT("send_fd failed\n");
+            goto err_proc;
         }
     }
 
@@ -179,15 +261,17 @@ int libsrpc_unix_server_addclient(libsrpc_server_t *srv, int sck)
 
     rc = epoll_ctl(ed->epfd, EPOLL_CTL_ADD, ed->socket, &ev);
     if(rc < 0) {
-        ERR_PRINT("unix_server: epoll_ctl failed\n");
-        goto err;
+        ERR_PRINT("epoll_ctl failed\n");
+        goto err_proc;
     }
 
     srv->clients++;
 
-    DBG_PRINT("unix_server: client added pid=%d clients=%d\n", ed->pid, srv->clients);
+    DBG_PRINT("client added pid=%d clients=%d\n", ed->pid, srv->clients);
 end:
     return(rc);
+err_proc:
+    libsrpc_proc_destroy(ed->pid);
 err:
     if(ed) srpc_pool_free(srv->pool_epcln, ed);
     close(sck);
@@ -195,7 +279,7 @@ err:
 }
 
 
-int libsrpc_unix_server_worker(libsrpc_server_t *srv, libsrpc_epoll_t *ed, struct epoll_event *ev)
+static int libsrpc_unix_server_worker(libsrpc_server_t *srv, libsrpc_epoll_t *ed, struct epoll_event *ev)
 {
     int rc = 0;
 
@@ -245,13 +329,13 @@ int libsrpc_unix_server_init(libsrpc_server_t *srv, const char *name)
     srv->pool_epcln = srpc_pool_create(128, sizeof(libsrpc_epoll_t));
     if(!srv->pool_epcln) {
         rc = -ENOMEM;
-        ERR_PRINT("unix_server: create pool failed\n");
+        ERR_PRINT("create pool failed\n");
         goto err;
     }
 
     srv->epfd = libsrpc_epoll_create();
     if(srv->epfd < 0) {
-        ERR_PRINT("unix_server: create epoll failed\n");
+        ERR_PRINT("create epoll failed\n");
         rc = -errno;
         goto err;
     }
@@ -259,7 +343,7 @@ int libsrpc_unix_server_init(libsrpc_server_t *srv, const char *name)
     srv->socket = libsrpc_unix_scoket_server_create(name);
     if(srv->socket <= 0) {
         rc = -errno;
-        if(errno != EADDRINUSE) ERR_PRINT("unix_server: create socket failed (%d) %s\n", errno, strerror(errno));
+        if(errno != EADDRINUSE) ERR_PRINT("create socket failed (%d) %s\n", errno, strerror(errno));
         goto err;
     }
 
@@ -288,6 +372,7 @@ int libsrpc_unix_server_exit(libsrpc_server_t *srv)
     libsrpc_epoll_t *ed = NULL;
     void *ptr = NULL;
 
+    if(!srv->init) return(0);
     srv->init = 0;
 
     close(srv->epfd);
@@ -330,24 +415,28 @@ static int recv_fd(int sock)
     msg.msg_controllen = sizeof(cmsgbuf);
 
     if (recvmsg(sock, &msg, 0) < 0) {
-        ERR_PRINT("unix_client: recvmsg failed\n");
+        ERR_PRINT("recvmsg failed = %s\n", strerror(errno));
         return -1;
     }
 
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
 
     if (!cmsg) {
-        ERR_PRINT("unix_client: CMSG_FIRSTHDR failed\n");
+        ERR_PRINT("CMSG_FIRSTHDR failed\n");
         return -1;
     }
 
     if (cmsg->cmsg_level != SOL_SOCKET) {
-        ERR_PRINT("unix_client: cmsg_level failed\n");
+        ERR_PRINT("cmsg_level failed\n");
         return -1;
     }
 
     if (cmsg->cmsg_type != SCM_RIGHTS) {
-        ERR_PRINT("unix_client: cmsg_type failed\n");
+        ERR_PRINT("cmsg_type failed\n");
+        return -1;
+    }
+
+    if (cmsg->cmsg_len < CMSG_LEN(sizeof(fd))) {
         return -1;
     }
 
@@ -401,37 +490,38 @@ static void *unix_client(void *arg)
 
     cli->socket = libsrpc_unix_socket_client_create(cli->sck_name);
     if(cli->socket <= 0) {
-        ERR_PRINT("unix_client: create socket failed\n");
-        goto err;
+        ERR_PRINT("create socket failed\n");
+        goto err_recv_fd;
+    }
+
+    rc = send_msg_regfn(cli->socket);
+    if(rc < 0) {
+        ERR_PRINT("send_msg_regfn failed\n");
+        goto err_recv_fd;
     }
 
     cli->shm_fd = recv_fd(cli->socket);
     if(cli->shm_fd <= 0) {
-        ERR_PRINT("unix_client: recv_fd failed\n");
-        goto err;
+        ERR_PRINT("recv_fd failed\n");
+        goto err_recv_fd;
     }
 
     rc = libsrpc_shmem_open(&simplerpc_data->shmempool, cli->shm_fd, SHMEM_BASE_VADR, cli->sck_name);
     if(rc < 0) {
-        ERR_PRINT("unix_client: shmem_open failed\n");
+        ERR_PRINT("shmem_open failed\n");
         goto err;
     }
 
-    simplerpc_data->pid_info = libsrpc_shmem_get_reg_pid(getpid());
-    if(!simplerpc_data->pid_info) {
-        ERR_PRINT("unix_client: libsrpc_shmem_get_reg_pid failed\n");
+    simplerpc_data->proc = libsrpc_proc_get(getpid());
+    if(!simplerpc_data->proc) {
+        ERR_PRINT("libsrpc_proc_get failed\n");
         goto err;
     }
+    simplerpc_data->proc_uid = simplerpc_data->proc->proc_uid;
 
-    rc = srpc_thread_rcv_req_start();
+    rc = libsrpc_thread_rcv_req_start();
     if (rc != 0) {
-        ERR_PRINT("unix_client: srpc_thread_rcv_req_start failed\n");
-        goto err;
-    }
-
-    rc = srpc_regfn_rpc_shm(simplerpc_data->pid_info);
-    if (rc != 0) {
-        ERR_PRINT("unix_client: srpc_regfn_rpc_shm failed\n");
+        ERR_PRINT("libsrpc_thread_rcv_req_start failed\n");
         goto err;
     }
 
@@ -439,7 +529,7 @@ static void *unix_client(void *arg)
 
     epfd = epoll_create1(EPOLL_CLOEXEC);
     if(epfd < 0) {
-        ERR_PRINT("unix_client: epoll_create1 failed\n");
+        ERR_PRINT("epoll_create1 failed\n");
         goto err;
     }
 
@@ -449,47 +539,48 @@ static void *unix_client(void *arg)
     ev.data.fd = cli->socket;
     rc = epoll_ctl(epfd, EPOLL_CTL_ADD, ev.data.fd, &ev);
     if(rc < 0) {
-        ERR_PRINT("unix_client: epoll_ctl failed\n");
+        ERR_PRINT("epoll_ctl failed\n");
         goto err;
     }
 
     /* Будильник для выхода из epoll_wait */
     cli->efd_exit = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if(cli->efd_exit < 0) {
-        ERR_PRINT("unix_client: eventfd failed efd_exit\n");
+        ERR_PRINT("eventfd failed efd_exit\n");
         goto err;
     }
     ev.events = EPOLLIN;
     ev.data.fd = cli->efd_exit;
     rc = epoll_ctl(epfd, EPOLL_CTL_ADD, ev.data.fd, &ev);
     if(rc < 0) {
-        ERR_PRINT("unix_client: epoll_ctl failed efd_exit\n");
+        ERR_PRINT("epoll_ctl failed efd_exit\n");
         goto err;
     }
 
-    job_futex_worker_done(&cli->jf); // Уведомим что всё инициализировано.
+    libsrpc_proc_set_run(simplerpc_data->proc); // Устанавливаем статус процесса в режим работы.
+    libsrpc_sem_post(&cli->sem_status); // Уведомим что всё инициализировано.
 
-    DBG_PRINT("unix_client: epoll_wait started\n");
+    DBG_PRINT("epoll_wait started\n");
     while(1) {
-        struct epoll_event ev;
-        char buf[32];
+        char buf[32] = {0};
+        memset(&ev, 0, sizeof(ev));
         rc = epoll_wait(epfd, &ev, 1, -1);
         DBG_PRINT("unix_client: epoll_wait %d event = %d\n", rc, ev.events);
         if(rc < 0) {
-            ERR_PRINT("unix_client: epoll_wait failed\n");
+            ERR_PRINT("epoll_wait failed\n");
             goto err;
         }
         if (ev.data.fd == cli->efd_exit) {
             uint64_t value;
             read(ev.data.fd, &value, sizeof(value));
-            DBG_PRINT("unix_client: efd_exit %d value = %lu\n", ev.data.fd, value);
+            DBG_PRINT("efd_exit %d value = %lu\n", ev.data.fd, value);
             goto end;
         }
         if (ev.events & (EPOLLHUP | EPOLLRDHUP)) goto err;
         if (ev.events & EPOLLIN) {
             rc = recv(ev.data.fd, buf, sizeof(buf), MSG_DONTWAIT);
             if(rc < 0) {
-                ERR_PRINT("unix_client: recv failed\n");
+                ERR_PRINT("recv failed\n");
                 goto err;
             }
             if(rc == 0) goto err;
@@ -497,22 +588,23 @@ static void *unix_client(void *arg)
     }
 
 end:
-    DBG_PRINT("unix_client: epoll_wait ended\n");
+    DBG_PRINT("epoll_wait ended\n");
     goto close;
 err:
-    job_futex_worker_done(&cli->jf); // Уведомим что произошла ошибка.
-    ERR_PRINT("unix_client: error\n");
+    libsrpc_sem_post(&cli->sem_status); // Уведомим что произошла ошибка.
+    ERR_PRINT("error\n");
 close:
     simplerpc_data->rpc_enable = false;
-    srpc_unregfn_rpc_shm(simplerpc_data->pid_info);
-    srpc_thread_rcv_req_stop();
+    libsrpc_proc_set_stop(simplerpc_data->proc); // Устанавливаем статус процесса в режим остановки.
+    libsrpc_thread_rcv_req_stop();
     if(cli->efd_exit > 0) close(cli->efd_exit);
     cli->efd_exit = -1;
     if(epfd > 0) close(epfd);
-    if(cli->socket > 0) close(cli->socket);
-    cli->socket = -1;
     if(cli->shm_fd > 0) close(cli->shm_fd);
     cli->shm_fd = -1;
+err_recv_fd:
+    if(cli->socket > 0) close(cli->socket);
+    cli->socket = -1;
     return(NULL);
 }
 
@@ -525,10 +617,13 @@ int libsrpc_unix_client_init(libsrpc_client_t *cli, const char *name)
     flags.flags |= THREAD_FLAG_DETACHED;
 
     DBG_PRINT("INIT client: %s\n", name);
-// сделать запус потока для работы с сервером, epoll_wait в потоке, в случе закрытия соединения - блокировать вызовы RPC.
 
     cli->sck_name = name;
-    job_futex_init(&cli->jf, 1);
+    rc = libsrpc_sem_init(&cli->sem_status, 0);
+    if(rc < 0) {
+        ERR_PRINT("sem_init failed\n");
+        goto err;
+    }
 
     rc = pthread_start(unix_client, cli, flags);
     if(rc < 0) {
@@ -537,7 +632,7 @@ int libsrpc_unix_client_init(libsrpc_client_t *cli, const char *name)
     }
 
     // Ждём инициализации клиента или ошибки.
-    rc = job_futex_client_wait(&cli->jf, 1ULL * 1000ULL * 1000ULL); // 1 секунда. 
+    rc = libsrpc_sem_wait(&cli->sem_status);
 
 err:
     return(rc);
