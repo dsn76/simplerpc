@@ -39,7 +39,7 @@ typedef struct libsrpc_proc_s {
     atomic_int      threads_wait;   // Количество ожидающих потоков в процессе.
     libsrpc_sem_t   sem_wakeup;     // Пробуждение потоков.
     libsrpc_list_head_t req_head;   // Список структур запросов в процессе, для обхода уборщиком мусора (RCU Hazard Pointer).
-    MpmcQueue       queue;          // Очередь запросов в процессе.
+    lf_mpmc_queue_t queue;          // Очередь запросов в процессе.
     int             threads_num;    // Ожидаемое количество потоков в процессе.
     libsrpc_proc_thread_t threads[0]; // threads[threads_num] - Массив потоков процесса == число ядер процессора, вычисляется на этапе выделения памяти для процесса.
 } libsrpc_proc_t;

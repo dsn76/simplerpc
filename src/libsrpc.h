@@ -1,6 +1,8 @@
 #ifndef FILE_LIBSRPC_H
 #define FILE_LIBSRPC_H
 
+#include <stdint.h>
+
 /* ------------------------------------------------------------------------------ */
 /* Публичное API библиотеки libsrpc.                                              */
 /* ------------------------------------------------------------------------------ */
@@ -13,6 +15,17 @@ typedef enum libsrpc_flag_send_rpc_s {
 } libsrpc_flag_send_rpc_t;
 
 #include "libsrpc_rpc_functions.h"
+
+/* ------------------------------------------------------------------------------ */
+
+/* Определение идентификаторов экспортируемых RPC функций */
+typedef enum e_libsrpc_funid {
+    LIBSRPC_FUNID_START = 16,
+    #define XF(flags,rettype,name,...)   libsrpc_funid_##name,
+        RPC_LIST
+    #undef XF
+    LIBSRPC_FUNID_MAX
+} libsrpc_funid_t;
 
 /* ------------------------------------------------------------------------------ */
 
@@ -32,9 +45,15 @@ int   libsrpc_shmem_link(void *ptr);                    /* Связывание 
 
 /* Опциональная замена стандартного аллокатора на аллокатор разделяемой памяти */
 #ifndef LIBSRPC_DISABLE_SUBSTITUTION_ALLOCATOR
-void srpc_alloc_sw_std(void);                          /* Переключение на стандартный аллокатор */
-void srpc_alloc_sw_shm(void);                          /* Переключение на аллокатор разделяемой памяти */
+void libsrpc_alloc_sw_std(void);                          /* Переключение на стандартный аллокатор */
+void libsrpc_alloc_sw_shm(void);                          /* Переключение на аллокатор разделяемой памяти */
 #endif
+
+#define LIBSRPC_TIMEOUT_DEFAULT 1000000 // 1 000 0000 микросекунд = 1 секунда.
+#define LIBSRPC_TIMEOUT_MINIMUM 100 // 0.1 миллисекунда.
+void libsrpc_timeout_oneshot_set(uint64_t timeout); /* Установка таймаута для ближайшего вызова RPC функции (приоритет высокий). */
+void libsrpc_timeout_func_set(libsrpc_funid_t funid, uint64_t timeout); /* Установка таймаута для конкретной экспортируемой RPC функции (приоритет средний). */
+void libsrpc_timeout_global_set(uint64_t timeout); /* Установка таймаута для всех RPC функций (приоритет низкий). */
 
 /* Получение количества результатов последнего запроса. Возвращает количество ответивших исполнителей. */
 int libsrpc_lastreq_num(void);

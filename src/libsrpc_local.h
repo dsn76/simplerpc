@@ -6,7 +6,7 @@
 
 #include "libsrpc_debug_print.h"
 #include "libsrpc_unix_socket.h"
-#include "libsrpc_mpmcq.h"
+#include "lf_mpmc_queue.h"
 #include "libsrpc_shmem.h"
 
 #define CACHELINESIZE   (64)
@@ -49,8 +49,9 @@ typedef struct simplerpc_s {
   libsrpc_client_t cli;
 } __attribute__((aligned(CACHELINESIZE))) simplerpc_t;
 
+#define LIBSRPC_RC_FLAG_LOCK  (0xC0000000U) /* Флаг подготовки ответа */
 #define LIBSRPC_RC_FLAG_READY (0x80000000U) /* Флаг готовности ответа */
-#define LIBSRPC_RC_MASK_READY (0x7FFFFFFFU) /* Маска для получения кода возврата */
+#define LIBSRPC_RC_MASK_FLAGS (0x3FFFFFFFU) /* Маска для получения кода возврата */
 typedef int srpc_rc_t; // Внутренний код возврата при выполнении RPC запроса, возникший в исполнителе.
 typedef struct libsrpc_response_s {
   _Atomic(libsrpc_proc_t *) hp_proc;   // От кого ожидаем ответ, после получения ответа, Hazard Pointer будет установлен на NULL.
@@ -111,7 +112,7 @@ static inline int libsrpc_req_is_corrupted(libsrpc_request_t *req)
   }
   libsrpc_request_t req_tmp = *req;
 
-  if(atomic_load_explicit(&req->sign, memory_order_acquire) != LIBSRPC_REQ_SIGN) {
+  if(req_tmp.sign != LIBSRPC_REQ_SIGN) {
     return(1);
   }
   if(!req_tmp.retnum || !req_tmp.retsz) {
@@ -129,12 +130,51 @@ static inline int libsrpc_req_is_corrupted(libsrpc_request_t *req)
 
 static inline libsrpc_response_t * libsrpc_req_get_response(libsrpc_request_t *req, unsigned int idx)
 {
-  if(libsrpc_req_is_corrupted(req) || idx >= req->retnum) {
+  if(!req) {
     return(NULL);
   }
   libsrpc_request_t req_tmp = *req;
   unsigned int offset = req_tmp.retoff + req_tmp.retsz * idx;
+  if(libsrpc_req_is_corrupted(req) || idx >= req->retnum) {
+    return(NULL);
+  }
   return((libsrpc_response_t *)&req->buf[offset]);
+}
+
+static inline int libsrpc_req_response_set(libsrpc_request_t *req, libsrpc_response_t *resp, void *val, size_t sz)
+{
+  srpc_rc_t expected = 0;
+  if(libsrpc_req_is_corrupted(req)) {
+    return(-EINVAL);
+  }
+  if(!atomic_compare_exchange_strong_explicit(&resp->rc, &expected, LIBSRPC_RC_FLAG_LOCK, memory_order_acquire, memory_order_relaxed)) {
+    return(-EBUSY);
+  }
+  memcpy(&resp->buf[0], val, sz);
+  atomic_store_explicit(&resp->rc, LIBSRPC_RC_FLAG_READY, memory_order_release);
+  return(LIBSRPC_RC_FLAG_READY);
+}
+
+static inline int libsrpc_req_response_get(libsrpc_response_t *resp, void *val, size_t sz)
+{
+  if(!resp || !val || !sz) {
+    return(-EINVAL);
+  }
+  for(int count = 0; count < 100; count++) {
+    srpc_rc_t final_rc = atomic_load_explicit(&resp->rc, memory_order_acquire);
+    if((unsigned)final_rc != 0 &&
+       (unsigned)final_rc != LIBSRPC_RC_FLAG_LOCK &&
+       (unsigned)final_rc != LIBSRPC_RC_FLAG_READY) {
+      return(-EBADFD);
+    }
+    if((unsigned)final_rc == LIBSRPC_RC_FLAG_READY) {
+      memcpy(val, &resp->buf, sz);
+      return(0);
+    }
+    __builtin_ia32_pause();
+  }
+  __libsrpc_errno_set(ETIMEDOUT);
+  return(-ETIMEDOUT);
 }
 
 #endif // FILE_LIBSRPC_LOCAL_H

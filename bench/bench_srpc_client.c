@@ -64,6 +64,8 @@ int main(int ac, char **av)
     printf("bench_srpc_client: pid=%d итераций=%zu потоков=%zu×%zu\n",
            getpid(), iters, nthreads, titers);
 
+    local_add_p(1, 2); // прогрев
+
     /* 1. Локальный вызов той же арности. */
     for (size_t i = 0; i < iters; i++) {
         uint64_t t0 = bench_now_ns();

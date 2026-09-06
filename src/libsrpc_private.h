@@ -5,7 +5,7 @@
 #include <semaphore.h>
 
 #include "libsrpc.h"
-#include "libsrpc_mpmcq.h"
+#include "lf_mpmc_queue.h"
 
 /* ------------------------------------------------------------------------------ */
 

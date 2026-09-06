@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 
 project(srpc
-    VERSION 0.2.0
+    VERSION 0.2.1
     LANGUAGES C
 )
 message(STATUS "================================")
@@ -109,7 +109,7 @@ set(SRPC_SOURCES
     src/libsrpc_shmem.c
     src/libsrpc_shm_gc.c
     src/libsrpc_errno.c
-    src/libsrpc_mpmcq.c
+    src/lf_mpmc_queue.c
     src/libsrpc_pthread.c
     src/libsrpc_list_spin.c
     src/libsrpc_proc.c

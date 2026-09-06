@@ -17,7 +17,6 @@
 #include "libsrpc_local.h"
 #include "libsrpc_errno.h"
 #include "libsrpc_shmem.h"
-#include "libsrpc_mpmcq.h"
 #include "libsrpc_shm_gc.h"
 
 

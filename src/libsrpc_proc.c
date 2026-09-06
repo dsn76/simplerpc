@@ -96,7 +96,7 @@ int libsrpc_proc_create(pid_t pid)
         goto err;
     }
 
-    mpmc_queue_init(&proc->queue);
+    lf_mpmc_queue_init(&proc->queue);
 
     rc = libsrpc_list_head_init(&proc->req_head);
     if(rc < 0) {

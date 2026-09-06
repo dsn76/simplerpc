@@ -2,6 +2,7 @@
 #define FILE_LIBSRPC_WRAPPER_H
 
 #include <semaphore.h>
+#include <time.h>
 
 #include "libsrpc_types.h"
 #include "libsrpc_errno.h"
@@ -46,6 +47,20 @@ static inline int libsrpc_sem_trywait(libsrpc_sem_t *sem)
 static inline int libsrpc_sem_timedwait(libsrpc_sem_t *sem, const struct timespec *abs_timeout)
 {
     return sem_timedwait(sem, abs_timeout);
+}
+
+/* timeout в микросекундах. */
+static inline int libsrpc_sem_wait_timeout_us(libsrpc_sem_t *sem, uint64_t timeout)
+{
+    struct timespec ts = {0};
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += timeout / 1000000ULL;
+    ts.tv_nsec += (timeout % 1000000ULL) * 1000ULL;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000L;
+    }
+    return sem_timedwait(sem, &ts);
 }
 
 

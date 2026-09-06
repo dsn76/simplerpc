@@ -15,6 +15,7 @@
     XF(ERECURSIVE,"Recursive RPC calls are prohibited")  \
     XF(ECANCELLED,"RPC call cancelled")  \
     XF(ENOTAVAILABLE,"Not available")  \
+    XF(ERPCWAITIMEDOUT,"RPC wait timeout")  \
 
 
 typedef enum {
