@@ -57,6 +57,9 @@ int main(int ac, char **av)
     size_t iters = (ac > 1) ? (size_t)strtoul(av[1], NULL, 10) : 4000;
     size_t nthreads = (ac > 2) ? (size_t)strtoul(av[2], NULL, 10) : 4;
     size_t titers = (ac > 3) ? (size_t)strtoul(av[3], NULL, 10) : 500;
+    if (iters == 0 || iters > 10000000) iters = 4000;
+    if (nthreads == 0 || nthreads > 256) nthreads = 4;
+    if (titers == 0 || titers > 10000000) titers = 500;
 
     uint64_t *s = calloc(iters, sizeof(*s));
     if (!s) return 1;

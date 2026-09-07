@@ -79,7 +79,7 @@ int libsrpc_proc_create(pid_t pid)
         return -EEXIST;
     }
 
-    size = sizeof(libsrpc_proc_t) + threads_num * sizeof(libsrpc_proc_thread_t);
+    size = sizeof(libsrpc_proc_t) + (size_t)threads_num * sizeof(libsrpc_proc_thread_t);
     proc = libsrpc_shmem_malloc_type(size, LIBSRPC_SHMDT_PROC);
     if (proc == NULL) {
         return -ENOMEM;
@@ -100,14 +100,14 @@ int libsrpc_proc_create(pid_t pid)
 
     rc = libsrpc_list_head_init(&proc->req_head);
     if(rc < 0) {
-        ERR_PRINT("list_head_init failed: %s\n", libsrpc_strerror(rc));
+        ERR_PRINT("list_head_init failed: %s\n", libsrpc_strerror(-rc));
         goto err;
     }
 
     atomic_store_explicit(&proc->sign, LIBSRPC_PROC_SIGN, memory_order_release);
     rc = libsrpc_list_push_front(&shm->proc_head, &proc->proc_node);
     if(rc < 0) {
-        ERR_PRINT("list_push_front failed: %s\n", libsrpc_strerror(rc));
+        ERR_PRINT("list_push_front failed: %s\n", libsrpc_strerror(-rc));
         goto err;
     }
 

@@ -33,7 +33,7 @@ void libsrpc_list_node_init(libsrpc_list_node_t *node)
         return;
 
     atomic_store_explicit(&node->next, NULL, memory_order_relaxed);
-    node->head = NULL;
+    atomic_store_explicit(&node->head, NULL, memory_order_relaxed);
 }
 
 int libsrpc_list_push_front(libsrpc_list_head_t *head, libsrpc_list_node_t *node)
@@ -43,14 +43,14 @@ int libsrpc_list_push_front(libsrpc_list_head_t *head, libsrpc_list_node_t *node
 
     pthread_spin_lock(&head->lock);
 
-    if (node->head != NULL) {
+    if (atomic_load_explicit(&node->head, memory_order_acquire) != NULL) {
         pthread_spin_unlock(&head->lock);
         return LIBSRPC_LIST_EALREADY;
     }
 
     libsrpc_list_node_t *old = atomic_load_explicit(&head->first, memory_order_relaxed);
     atomic_store_explicit(&node->next, old, memory_order_relaxed);
-    node->head = head;
+    atomic_store_explicit(&node->head, head, memory_order_release);
     atomic_store_explicit(&head->first, node, memory_order_release);
     atomic_fetch_add_explicit(&head->write_ops, 1, memory_order_relaxed);
 
@@ -63,7 +63,7 @@ int libsrpc_list_remove(libsrpc_list_node_t *node)
     if (node == NULL)
         return LIBSRPC_LIST_EINVAL;
 
-    libsrpc_list_head_t *head = node->head;
+    libsrpc_list_head_t *head = atomic_load_explicit(&node->head, memory_order_acquire);
     if (head == NULL)
         return LIBSRPC_LIST_ENOTFOUND;
 
@@ -97,7 +97,7 @@ int libsrpc_list_remove(libsrpc_list_node_t *node)
 
     atomic_fetch_add_explicit(&head->write_ops, 1, memory_order_relaxed);
 
-    node->head = NULL;
+    atomic_store_explicit(&node->head, NULL, memory_order_release);
     atomic_store_explicit(&node->next, NULL, memory_order_relaxed);
 
     pthread_spin_unlock(&head->lock);

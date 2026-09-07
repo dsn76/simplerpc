@@ -55,6 +55,7 @@ static int measure(const char *name, int fd_req, int fd_rsp,
 int main(int ac, char **av)
 {
     size_t iters = (ac > 1) ? (size_t)strtoul(av[1], NULL, 10) : 4000;
+    if (iters == 0 || iters > 10000000) iters = 4000;
     uint64_t *s = calloc(iters, sizeof(*s));
     if (!s) return 1;
 

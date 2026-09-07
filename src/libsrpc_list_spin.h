@@ -7,7 +7,7 @@
 
 typedef struct libsrpc_list_node {
     _Atomic(struct libsrpc_list_node *) next;
-    struct libsrpc_list_head          *head;
+    _Atomic(struct libsrpc_list_head *) head;
 } libsrpc_list_node_t;
 
 typedef struct libsrpc_list_head {

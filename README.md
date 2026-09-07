@@ -222,3 +222,5 @@ make all
 ## 📜 Лицензия
 
 Код `libsrpc` распространяется под лицензией **Apache-2.0**. Подробности смотрите в файле [LICENSE](LICENSE).
+
+[![Coverity Scan Build Status](https://scan.coverity.com/projects/33264/badge.svg)](https://scan.coverity.com/projects/simplerpc)

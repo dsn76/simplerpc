@@ -239,7 +239,11 @@ static int libsrpc_unix_server_addclient(libsrpc_server_t *srv, int sck)
 
     /* Сообщение регистрации читается до epoll; таймаут — чтобы демон не блокировался навсегда. */
     struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
-    setsockopt(sck, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    rc = setsockopt(sck, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if(rc < 0) {
+        ERR_PRINT("setsockopt failed\n");
+        goto err;
+    }
 
     rc = read_msg_regfn(sck, ed->pid);
     if(rc < 0) {
@@ -457,7 +461,7 @@ static int libsrpc_unix_socket_client_create(const char *name)
 
     addr.sun_family = AF_UNIX;
     /* abstract socket: first byte = '\0' */
-    strcpy(addr.sun_path + 1, name);
+    strncpy(addr.sun_path + 1, name, sizeof(addr.sun_path) - 2);
 
     socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(name);
 
@@ -572,7 +576,15 @@ static void *unix_client(void *arg)
         }
         if (ev.data.fd == cli->efd_exit) {
             uint64_t value;
-            read(ev.data.fd, &value, sizeof(value));
+            ssize_t rl = read(ev.data.fd, &value, sizeof(value));
+            if(rl < 0) {
+                ERR_PRINT("read failed\n");
+                goto err;
+            }
+            if(rl == 0) {
+                ERR_PRINT("read failed\n");
+                goto err;
+            }
             DBG_PRINT("efd_exit %d value = %lu\n", ev.data.fd, value);
             goto end;
         }

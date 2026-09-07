@@ -35,6 +35,7 @@ int main(int ac, char **av)
     int seconds = 60;
 
     if (ac > 1) seconds = atoi(av[1]);
+    if (seconds <= 0 || seconds > 3600) seconds = 60;
 
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
