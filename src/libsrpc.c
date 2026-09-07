@@ -48,6 +48,7 @@
 
 // return в зависимости от типа.
 #define RETDATA(type, data) EVAL(IIF(EQUAL(type,void))(return,return(*(type*)(data))))
+#define RLEN(type) IIF(EQUAL(type, void))(0, sizeof(type))
 
 #define ALIGNLONG(x) (((size_t)(x) + sizeof(long) - 1) & ~(sizeof(long) - 1))
 /* ============================================================================== */
@@ -471,7 +472,7 @@ static rettype sRPCFN(name)(M_ARGFUN(__VA_ARGS__)) { \
     int len=0; int rlen=0; int pos=0; \
     libsrpc_request_t *req = NULL; \
     __libsrpc_errno_clear(); \
-    if(strcmp("void",#rettype)!=0) rlen = sizeof(rettype); \
+    rlen = RLEN(rettype); \
     char rbuf[rlen]; \
     memset(rbuf, 0, rlen); \
     len = M_REQSIZE(__VA_ARGS__) 0; \

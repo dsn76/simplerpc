@@ -66,7 +66,7 @@ int libsrpc_proc_create(pid_t pid)
     libsrpc_proc_t *proc = NULL;
     long threads_num = sysconf(_SC_NPROCESSORS_ONLN);
 
-    if (threads_num <= 0 || pid <= 0) {
+    if (threads_num <= 0 || threads_num > 1024 || pid <= 0) {
         return -EINVAL;
     }
 
@@ -80,6 +80,9 @@ int libsrpc_proc_create(pid_t pid)
     }
 
     size = sizeof(libsrpc_proc_t) + (size_t)threads_num * sizeof(libsrpc_proc_thread_t);
+    if (size < sizeof(libsrpc_proc_t)) {
+        return -EINVAL;
+    }
     proc = libsrpc_shmem_malloc_type(size, LIBSRPC_SHMDT_PROC);
     if (proc == NULL) {
         return -ENOMEM;
