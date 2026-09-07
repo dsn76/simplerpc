@@ -62,6 +62,9 @@ DBG_PRINT("INIT shm\n");
     pool->shm->basevadr = virtaddr;
     pool->shm->shmsize = size;
     strncpy(pool->shm->sign, name, sizeof(pool->shm->sign)-1);
+    for(unsigned int i = 0; i < sRPC_FNNUM; i++) {
+        atomic_init(&pool->shm->regfn.req_send_rr[i], 0); // чтоб анализатор отстал :)
+    }
 
 DBG_PRINT("INIT mempool in shm\n");
     pool->shm->poolsize = pool->shm->shmsize - sizeof(*pool->shm);

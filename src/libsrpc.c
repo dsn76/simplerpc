@@ -99,7 +99,7 @@ void libsrpc_timeout_global_set(uint64_t timeout)
 int libsrpc_lastreq_num(void)
 {
   libsrpc_request_t *req = current_req;
-  if(libsrpc_req_is_corrupted(req)) {
+  if(libsrpc_req_is_corrupted(req, NULL)) {
     return(0);
   }
   return(req->retnum);
@@ -115,7 +115,7 @@ int libsrpc_lastreq_get(int idx, void *retval, size_t sz)
     return(-EINVAL);
   }
 
-  if(libsrpc_req_is_corrupted(req) || idx >= (long)req->retnum) {
+  if(libsrpc_req_is_corrupted(req, NULL) || idx >= (long)req->retnum) {
     return(-ENOTAVAILABLE);
   }
 
@@ -174,7 +174,8 @@ static int libsrpc_send_request_one(libsrpc_proc_t *proc, libsrpc_request_t *req
 static void libsrpc_send_request(libsrpc_request_t *req, libsrpc_flag_send_rpc_t flags)
 {
   int rc = 0;
-  int retnum = 0;
+  unsigned int retnum = 0;
+  unsigned int rr_pos = 0;
   int fidx = 0;
   libsrpc_shmem_t *shm = libsrpc_shmem_get();
   srpc_regfn_shm_t *p_regfn = NULL;
@@ -198,11 +199,6 @@ static void libsrpc_send_request(libsrpc_request_t *req, libsrpc_flag_send_rpc_t
     return;
   }
 
-  retnum = req->retnum;
-  if(flags == RPC_SEND_FIRST) {
-    retnum = 1;
-  }
-
   fidx = sRPC_ID2IDX(req->funid);
   if(fidx < 0 || fidx >= sRPC_FNNUM) {
     __libsrpc_errno_set(EINVAL);
@@ -212,13 +208,28 @@ static void libsrpc_send_request(libsrpc_request_t *req, libsrpc_flag_send_rpc_t
   mb = &p_regfn->funcs[fidx].main_block;
   eb = p_regfn->funcs[fidx].ext_block;
 
+  retnum = req->retnum;
+  if(flags == RPC_SEND_FIRST) {
+    retnum = 1;
+  }
+  if(flags == RPC_SEND_RR) {
+    rr_pos = atomic_fetch_add(&p_regfn->req_send_rr[fidx], 1);
+    rr_pos = rr_pos % retnum;
+    retnum = 1;
+  }
+  req->retnum = retnum;
+
   libsrpc_proc_t *proc = NULL;
-  int it = 0;
+  libsrpc_proc_t *proc_last = NULL;
+  unsigned int it = 0;
+  unsigned int rr_cnt = 0;
 DBG_PRINT("send request to %d workers\n", retnum);
   // Отправляем запросы в очереди всех (но не более retnum) зарегистрированных процессов, которые имеют запущенные потоки.
   for(unsigned int i = 0; i < LIBSRPC_RFMB_SZ && it < retnum; i++) {
     proc = atomic_load(&mb->proc[i]);
     if(proc != NULL) {
+      if(flags == RPC_SEND_LAST) { proc_last = proc; continue; }
+      if(flags == RPC_SEND_RR && rr_pos != rr_cnt++) continue;
       rc = libsrpc_send_request_one(proc, req, it);
       if(rc == 0) it++;
     }
@@ -228,10 +239,18 @@ DBG_PRINT("send request to %d workers\n", retnum);
     for(unsigned int i = 0; i < eb->szfn && it < retnum; i++) {
       proc = atomic_load(&eb->proc[i]);
       if(proc != NULL) {
+        if(flags == RPC_SEND_LAST) { proc_last = proc; continue; }
+        if(flags == RPC_SEND_RR && rr_pos != rr_cnt++) continue;
         rc = libsrpc_send_request_one(proc, req, it);
         if(rc == 0) it++;
       }
     }
+  }
+
+  if(flags == RPC_SEND_LAST && proc_last != NULL) {
+    rc = libsrpc_send_request_one(proc_last, req, it);
+    if(rc == 0) it++;
+    retnum = 1;
   }
 
   if(it == 0) { /* не удалось отправить ни один запрос */
@@ -240,7 +259,7 @@ DBG_PRINT("send request to %d workers\n", retnum);
     return;
   }
   if(it != retnum) { /* не удалось отправить все запросы */
-    ERR_PRINT("some requests not sent: retnum=%d, it=%d\n", retnum, it);
+    ERR_PRINT("some requests not sent: retnum=%u, it=%u\n", retnum, it);
     retnum = it;
   }
 
@@ -262,7 +281,7 @@ DBG_PRINT("send request to %d workers\n", retnum);
 
   DBG_PRINT("wait for responses from customers\n");
   /* Ждём обработки всех запросов исполнителями. */
-  int cnt_rcv;
+  unsigned int cnt_rcv;
   do{
     cnt_rcv = 0;
     rc = libsrpc_sem_wait_timeout_us(&req->sem_wakeup, timeout);
@@ -270,7 +289,7 @@ DBG_PRINT("send request to %d workers\n", retnum);
       int err = errno;
       if(err == ETIMEDOUT) {
         /* Промаркируем пустые ответы как ошибки таймаута */
-        for(int i = 0; i < retnum; i++) {
+        for(unsigned int i = 0; i < retnum; i++) {
           srpc_rc_t expected = 0;
           libsrpc_response_t *resp = libsrpc_req_get_response(req, i);
           if(! resp) continue;
@@ -285,7 +304,7 @@ DBG_PRINT("send request to %d workers\n", retnum);
     }
 
     /* Подсчитаем полученные ответы. */
-    for(int i = 0; i < retnum; i++) {
+    for(unsigned int i = 0; i < retnum; i++) {
       libsrpc_response_t *resp = libsrpc_req_get_response(req, i);
       if(! resp) continue;
       if(atomic_load_explicit(&resp->hp_proc, memory_order_acquire) != NULL &&
@@ -325,7 +344,7 @@ int libsrpc_req_is_busy_proc(libsrpc_request_t *req)
 /* TODO: переделать на проверку по всем живым процессам, и убрать проверку corrupted и в req не заходить */
 int libsrpc_req_is_busy(libsrpc_request_t *req)
 {
-  if(libsrpc_req_is_corrupted(req)) {
+  if(libsrpc_req_is_corrupted(req, NULL)) {
     return(0);
   }
 
@@ -350,7 +369,7 @@ static int libsrpc_req_is_bad(libsrpc_request_t *req)
   if(!req) {
     return(1);
   }
-  if(libsrpc_req_is_corrupted(req)) {
+  if(libsrpc_req_is_corrupted(req, NULL)) {
     return(1);
   }
   for(unsigned i = 0; i < req->retnum; i++) {
@@ -378,6 +397,8 @@ static void libsrpc_req_free(libsrpc_request_t *req, int is_bad)
     libsrpc_shmem_free(req);
   }
 }
+
+static _Atomic(uint32_t) libsrpc_req_seq_num = 0;
 
 static libsrpc_request_t* libsrpc_req_alloc(int funid, int reqlen, int retsz)
 {
@@ -433,6 +454,7 @@ static libsrpc_request_t* libsrpc_req_alloc(int funid, int reqlen, int retsz)
     libsrpc_list_push_front(&proc->req_head, &req->node);
   }
 
+  req->seq_num = atomic_fetch_add(&libsrpc_req_seq_num, 1);
   req->funid  = funid;
   req->bufsz  = sz;
   req->retoff = retoff;
@@ -505,7 +527,7 @@ static simplerpc_t srpc = {
 #define M_ARGNAMES(...) EVAL(FOREACH2(M_ARGNAME,p,,__VA_ARGS__))
 
 /* RPC Callbacks */
-static int libsrpc_callback_func(libsrpc_request_t *req, libsrpc_response_t *resp)
+static int libsrpc_callback_func(libsrpc_request_t *req, libsrpc_response_t *resp, libsrpc_req_ctrl_t *ctrl)
 {
   int rc = 0;
 
@@ -531,7 +553,7 @@ static int libsrpc_callback_func(libsrpc_request_t *req, libsrpc_response_t *res
                 , \
                     /* Если не void: сохраняем результат и пишем в буфер ответов */ \
                     rettype retval = name(M_ARGNAMES(__VA_ARGS__)); \
-                    rc = libsrpc_req_response_set(req, resp, &retval, sizeof(retval)); \
+                    rc = libsrpc_req_response_set(req, resp, ctrl, &retval, sizeof(retval)); \
                 ) \
                 (void)pos; \
             } \
@@ -556,13 +578,13 @@ static int libsrpc_request_lock(libsrpc_proc_thread_t *thread, libsrpc_request_t
     return -EINVAL;
   }
 
-  if(libsrpc_req_is_corrupted(req)) {
+  if(libsrpc_req_is_corrupted(req, NULL)) {
     return(-EBADMSG);
   }
 
   atomic_store_explicit(&thread->hp_req, (void*)req, memory_order_release);
 
-  if(libsrpc_req_is_corrupted(req)) {
+  if(libsrpc_req_is_corrupted(req, NULL)) {
     atomic_store_explicit(&thread->hp_req, NULL, memory_order_release);
     return(-EBADMSG);
   }
@@ -593,10 +615,11 @@ static int libsrpc_dequeue_request(libsrpc_proc_t *proc, libsrpc_proc_thread_t *
     }
     if(! req) continue;
 
-    if(libsrpc_req_is_corrupted(req)) {
+    if(libsrpc_req_is_corrupted(req, NULL)) {
       ERR_PRINT("corrupted request: req=%p\n", req);
       continue;
     }
+    libsrpc_req_ctrl_t ctrl = atomic_load_explicit(&req->control, memory_order_acquire);
 
     libsrpc_request_lock(thread, req);
 
@@ -624,7 +647,7 @@ static int libsrpc_dequeue_request(libsrpc_proc_t *proc, libsrpc_proc_thread_t *
 
     INF_PRINT("dequeue success[%d]: req=%p funid=%d retsz=%d\n", sched_getcpu(), req, req->funid, req->retsz);
 
-    rc = libsrpc_callback_func(req, resp);
+    rc = libsrpc_callback_func(req, resp, &ctrl);
     if((unsigned int)rc != LIBSRPC_RC_FLAG_READY) {
       libsrpc_request_unlock(thread);
       WRN_PRINT("callback function failed: rc=%d\n", rc);
@@ -698,7 +721,7 @@ void libsrpc_thread_rcv_queue_clear(libsrpc_proc_t *proc)
 
   /* освободим зависшие RPC запросы в очереди */
   while(lf_mpmc_queue_try_dequeue(&proc->queue, (void**)&req) == LF_QUEUE_OK) {
-    if(libsrpc_req_is_corrupted(req)) continue;
+    if(libsrpc_req_is_corrupted(req, NULL)) continue;
     /* Найдём свой слот для ответа на запрос. */
     libsrpc_response_t *resp = NULL;
     for(unsigned int i = 0; i < req->retnum; i++) {

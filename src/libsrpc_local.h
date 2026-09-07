@@ -17,6 +17,10 @@
 #define SHMEM_SIZE      (2ULL*1024ULL*1024ULL)
 #endif
 
+#define LIBSRPC_TIMEOUT_DEFAULT 1000000 // 1 000 000 микросекунд = 1 секунда.
+#define LIBSRPC_TIMEOUT_MINIMUM 100 // 0.1 миллисекунда.
+
+
 typedef struct srpc_func_s {
   const void *rpc; // Указатель на функцию в библиотеке libsrpc.
   const void *loc; // Указатель на функцию в локальном приложении.
@@ -60,11 +64,18 @@ typedef struct libsrpc_response_s {
 } libsrpc_response_t;
 
 #define LIBSRPC_REQ_SIGN (0x741B8CD7U)
+typedef uint64_t libsrpc_req_ctrl_t;
 typedef struct libsrpc_request_s {
   libsrpc_list_node_t node;       // Список запросов в процессе.
   libsrpc_sem_t       sem_wakeup; // Пробуждение вызывающего потока.
   _Atomic(void *)     hp_regfn;   // Hazard Pointer для реестра функций.
-  _Atomic(uint32_t)   sign;       // Сигнатура запроса.
+  union {
+    _Atomic(libsrpc_req_ctrl_t) control;   // Контрольные поля запроса.
+    struct {
+      _Atomic(uint32_t) sign;     // Сигнатура запроса.
+              uint32_t  seq_num;  // Номер последовательности запроса.
+    };
+  };
   int                 funid;      // ID функции.
   unsigned int        bufsz;      // Размер буфера данных.
   unsigned int        retoff;     // Позиция в буфере для размещения первого ответа.
@@ -103,7 +114,7 @@ static inline int libsrpc_req_destroy(libsrpc_request_t *req)
   return(0);
 }
 
-static inline int libsrpc_req_is_corrupted(libsrpc_request_t *req)
+static inline int libsrpc_req_is_corrupted(libsrpc_request_t *req, libsrpc_req_ctrl_t *ctrl)
 {
   unsigned int size = 0;
 
@@ -112,6 +123,9 @@ static inline int libsrpc_req_is_corrupted(libsrpc_request_t *req)
   }
   libsrpc_request_t req_tmp = *req;
 
+  if(ctrl && *ctrl != req_tmp.control) {
+    return(1);
+  }
   if(req_tmp.sign != LIBSRPC_REQ_SIGN) {
     return(1);
   }
@@ -120,6 +134,9 @@ static inline int libsrpc_req_is_corrupted(libsrpc_request_t *req)
   }
   size = sizeof(libsrpc_request_t) + req_tmp.retoff + req_tmp.retsz * req_tmp.retnum;
   if(req_tmp.bufsz < size) {
+    return(1);
+  }
+  if(ctrl && atomic_load_explicit(&req->control, memory_order_acquire) != *ctrl) {
     return(1);
   }
   if(atomic_load_explicit(&req->sign, memory_order_acquire) != LIBSRPC_REQ_SIGN) {
@@ -135,16 +152,16 @@ static inline libsrpc_response_t * libsrpc_req_get_response(libsrpc_request_t *r
   }
   libsrpc_request_t req_tmp = *req;
   unsigned int offset = req_tmp.retoff + req_tmp.retsz * idx;
-  if(libsrpc_req_is_corrupted(req) || idx >= req->retnum) {
+  if(libsrpc_req_is_corrupted(req, NULL) || idx >= req->retnum) {
     return(NULL);
   }
   return((libsrpc_response_t *)&req->buf[offset]);
 }
 
-static inline int libsrpc_req_response_set(libsrpc_request_t *req, libsrpc_response_t *resp, void *val, size_t sz)
+static inline int libsrpc_req_response_set(libsrpc_request_t *req, libsrpc_response_t *resp, libsrpc_req_ctrl_t *ctrl, void *val, size_t sz)
 {
   srpc_rc_t expected = 0;
-  if(libsrpc_req_is_corrupted(req)) {
+  if(libsrpc_req_is_corrupted(req, ctrl)) {
     return(-EINVAL);
   }
   if(!atomic_compare_exchange_strong_explicit(&resp->rc, &expected, LIBSRPC_RC_FLAG_LOCK, memory_order_acquire, memory_order_relaxed)) {

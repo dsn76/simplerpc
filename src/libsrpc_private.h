@@ -54,6 +54,7 @@ typedef struct srpc_regfn_shm_s {
         _Atomic(srpc_regfn_ext_block_t *)   ext_block; // указатель на следующую структуру в списке.
         srpc_regfn_main_block_t             main_block; // блок регистрации процессов для вызова этой RPC функции.
     } funcs[sRPC_FNNUM];
+    atomic_int req_send_rr[sRPC_FNNUM]; // Счётчики отправки запросов в RR режиме.
 } srpc_regfn_shm_t;
 
 typedef struct srpc_bmp_func_s {

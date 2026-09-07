@@ -49,8 +49,6 @@ void libsrpc_alloc_sw_std(void);                          /* Переключе�
 void libsrpc_alloc_sw_shm(void);                          /* Переключение на аллокатор разделяемой памяти */
 #endif
 
-#define LIBSRPC_TIMEOUT_DEFAULT 1000000 // 1 000 0000 микросекунд = 1 секунда.
-#define LIBSRPC_TIMEOUT_MINIMUM 100 // 0.1 миллисекунда.
 void libsrpc_timeout_oneshot_set(uint64_t timeout); /* Установка таймаута для ближайшего вызова RPC функции (приоритет высокий). */
 void libsrpc_timeout_func_set(libsrpc_funid_t funid, uint64_t timeout); /* Установка таймаута для конкретной экспортируемой RPC функции (приоритет средний). */
 void libsrpc_timeout_global_set(uint64_t timeout); /* Установка таймаута для всех RPC функций (приоритет низкий). */
