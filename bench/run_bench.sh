@@ -8,6 +8,7 @@ set -e
 
 BUILD_DIR="${1:-build}"
 ITERS="${2:-4000}"
+NTHREADS="${3:-4}"
 BENCH_DIR="$BUILD_DIR/bench"
 
 if [ ! -x "$BENCH_DIR/bench_srpc_client" ]; then
@@ -30,7 +31,7 @@ echo "=== sRPC ==="
 SERVER_PID=$!
 sleep 2
 
-"$BENCH_DIR/bench_srpc_client" "$ITERS" 4 500 || true
+"$BENCH_DIR/bench_srpc_client" "$ITERS" "$NTHREADS" "$ITERS" || true
 
 kill -TERM "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
