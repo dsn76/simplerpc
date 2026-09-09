@@ -43,7 +43,7 @@
 * **所有权模型（UID）：** 每个块头含 `uid[12]` 数组。只有当所有属主都解除关联后，块才会归还内存池。`libsrpc` 向分配器传递 `proc_uid`——由守护进程签发的 16 位进程标识（守护进程自身为 `DAEMON_PROC_UID = 1`）。`libsrpc_shmem_link()` 允许进程将自己加为其他进程的块的属主，从而保护它不被释放。
 * **块的类型化：** 块头中有一个 15 位的 `data_type` 字段，存储 `libsrpc_shm_data_type_t` 中的一种类型：`USER`（应用数据）、`PROC`（进程描述符）、`REGFN`（函数注册表块）、`REQUEST`（RPC 请求块）。垃圾回收器和析构函数依据该字段区分用户内存与服务内存。
 * **延迟清理标志（`dc`）：** 同一头部字段中的 1 个比特。它充当 retire 标记："块在逻辑上已死，但当前不能释放"。由 `libsrpc_shmem_free_dc()`（= `tlsf_setdc()`）置位，由垃圾回收器读取。
-* **分配器劫持（Allocator Hijacking，可选）：** 库可以拦截标准函数 `malloc`、`calloc`、`realloc` 和 `free`，并通过 `dlsym(RTLD_NEXT)` 取得原始函数。借助 `Thread Local Storage`（TLS），线程可以在系统分配器与共享内存分配器之间"热切换"（`srpc_alloc_sw_std()` / `srpc_alloc_sw_shm()`）。默认通过 `DISABLE_ALLOC=ON` 将整段代码从构建中剔除。
+* **分配器劫持（Allocator Hijacking，可选）：** 库可以拦截标准函数 `malloc`、`calloc`、`realloc` 和 `free`，并通过 `dlsym(RTLD_NEXT)` 取得原始函数。借助 `Thread Local Storage`（TLS），线程可以在系统分配器与共享内存分配器之间"热切换"（`libsrpc_alloc_sw_std()` / `libsrpc_alloc_sw_shm()`）。默认通过 `DISABLE_ALLOC=ON` 将整段代码从构建中剔除。
 
 ### 4. 垃圾回收器（共享内存 GC）
 一个**只存活于守护进程内**的独立线程（由 `libsrpc_shmem_create()` 初始化），负责回收那些因其他进程中可能存在读者而不能立即释放的服务结构。
@@ -90,14 +90,14 @@
 * **签名与状态：** `sign`（`LIBSRPC_PROC_SIGN`）和 `status` 均为原子量。`libsrpc_proc_is_valid()` 要求签名正确且状态为 `RUN`，因此对进程的作废对所有其他进程立即可见，无需加锁。
 * **`proc_uid`：** 由守护进程签发的 16 位标识；用作 TLSF 分配器中的属主 UID。
 * **队列与信号量：** 每个进程拥有自己的 MPMC 队列，以及一个供其全部执行方线程共用的唤醒信号量 `sem_wakeup`。
-* **线程数组：** `threads[]` 位于同一内存块中，大小按在线 CPU 数（`sysconf(_SC_NPROCESSORS_ONLN)`）确定。每个元素含 `hp_req`——指向正在处理请求的 Hazard Pointer。
+* **线程数组：** `threads[]` 位于同一内存块中，大小按在线 CPU 数（`sysconf(_SC_NPROCESSORS_ONLN)`）确定。工作线程本身按 `sched_getaffinity` 掩码启动（`pthread_start_all_cpu`）。每个元素含 `hp_req`——指向正在处理请求的 Hazard Pointer。
 * **请求列表：** `req_head` —— 该进程全部请求块的链表，供垃圾回收器遍历。
 
 ### 8. 同步与队列
 0.1.x 版本中自研的 futex 实现（`libsrpc_futex.*`）已删除；同步机制建立在共享内存中的 POSIX 原语之上。
 
-* **MPMC 队列：** 无锁（lock-free）有界多生产者多消费者队列（Vyukov 方案：带 `sequence` 计数器的单元数组），置于共享内存中。用于把任务从客户端交给执行方的工作线程。单元按缓存行对齐，`enqueue_pos` 与 `dequeue_pos` 分置于不同缓存行。容量为 2 的幂，构建时设定（`MPMCQ_DEGREE`，默认 `2^10 = 1024`）。单元中存放的不是请求本身，而是它在共享内存中的指针加上应答槽索引。
-* **POSIX 信号量：** 以 `pshared = 1` 初始化并置于共享内存的 `sem_t` 信号量，用于在队列无任务时使工作线程休眠与唤醒（节省 CPU）。外面包了一层薄薄的 `libsrpc_sem_*` 封装（`libsrpc_wrapper.h`），以便必要时替换实现。唤醒是按需的：仅当进程存在等待线程时才调用 `sem_post`。
+* **MPMC 队列：** 无锁队列 `lf_mpmc_queue`（Vyukov 方案：带 `seq` 计数器的单元数组），置于共享内存中的 `libsrpc_proc_t` 内。用于把任务从客户端交给执行方的工作线程。单元按缓存行对齐（`alignas(64)`），`head` 与 `tail` 分置于不同缓存行。容量为 2 的幂，构建时设定（`MPMCQ_DEGREE`，默认 `2^10 = 1024`）。单元中只存放指向共享内存中 `libsrpc_request_t` 的指针；工作线程通过 `resp->hp_proc` 找到自己的应答槽。
+* **POSIX 信号量：** 以 `pshared = 1` 初始化并置于共享内存的 `sem_t` 信号量，用于在队列无任务时使工作线程休眠与唤醒（节省 CPU）。外面包了一层薄薄的 `libsrpc_sem_*` 封装（`libsrpc_wrapper.h`），以便必要时替换实现。唤醒是按需的：存在等待线程（`threads_wait > 0`）或进程恰好只有一个工作线程（`threads_run == 1`）时才调用 `sem_post`。
 * **请求体内的信号量：** 每个 `libsrpc_request_t` 都自带一个 `sem_wakeup`——执行方用它通知调用线程应答已就绪。它取代了早期版本的"Job Futex"。
 * **自旋锁链表：** `libsrpc_list_spin` —— 单链表，写操作在 `pthread_spinlock_t` 保护下进行，遍历通过带 `acquire` 语义的原子加载实现无锁。用于进程列表和请求列表。
 * **定长块池：** `libsrpc_fixblockalloc` —— 基于 FIFO 索引环的快速池，支持自动扩容（`nextpool`），供守护进程在*本地*（非共享）内存中管理客户端连接描述符。它不含同步机制，按单线程使用设计——访问仅来自守护进程的主 `epoll` 循环。
@@ -107,30 +107,31 @@
 
 ```text
 libsrpc_request_t
-+----------------------------------------------------------+
-| node | sem_wakeup | sign | funid | bufsz | retoff | retsz | retnum |
-+----------------------------------------------------------+
-| buf[]:                                                   |
-|   [参数 .......]  <- retoff = ALIGNLONG(len(args))        |
-|   [libsrpc_response_t #0][ret]  <- 每个大小 retsz          |
-|   [libsrpc_response_t #1][ret]                            |
-|   ...                          <- 共 retnum 个槽位         |
-+----------------------------------------------------------+
++----------------------------------------------------------------------+
+| node | sem_wakeup | hp_regfn | sign | seq_num | funid | bufsz |      |
+| retoff | retsz | retnum |                                            |
++----------------------------------------------------------------------+
+| buf[]:                                                               |
+|   [参数 .......]  <- retoff = ALIGNLONG(len(args))                    |
+|   [libsrpc_response_t #0][ret]  <- 每个大小 retsz                      |
+|   [libsrpc_response_t #1][ret]                                        |
+|   ...                          <- 共 retnum 个槽位                     |
++----------------------------------------------------------------------+
 
 libsrpc_response_t: { hp_proc (等待谁应答), rc, buf[] }
 ```
 
 * **请求块缓存：** 指向最后一个块的指针保存在 TLS（`current_req`）中。若新请求放得下——直接复用该块，不触碰分配器；放不下——释放旧块并按两倍余量分配新块。热路径上根本不调用分配器。同一指针还服务于 `libsrpc_lastreq_num()` / `libsrpc_lastreq_get()`。
-* **就绪协议：** 执行方在 `resp->rc` 中写入标志 `LIBSRPC_RC_FLAG_READY`（`0x80000000`）或负的错误码。客户端仅在与标志精确匹配时才认为应答有效。
+* **就绪协议：** 执行方先置 `LIBSRPC_RC_FLAG_LOCK`（`0xC0000000`），拷贝结果后再发布 `LIBSRPC_RC_FLAG_READY`（`0x80000000`），或写入负的错误码。包装器中的客户端仅在与就绪标志精确匹配时才认为应答有效。
 * **校验：** `libsrpc_req_is_corrupted()` 检查签名（在读取字段前后各做一次带 `acquire` 语义的读取）以及尺寸的一致性。`libsrpc_req_destroy()` 通过 CAS 清除签名，因此重复销毁是安全的——这保护了 GC 与执行方并发工作时的 use-after-free。
-* **分派策略：** `RPC_SEND_ALL` —— 请求发给所有已注册的执行方（`retnum = num_all`）；`RPC_SEND_FIRST` —— 只发给第一个可用的（`retnum = 1`）。`RPC_SEND_LAST` 与 `RPC_SEND_RR` 已在 API 中声明，但尚未实现，目前行为等同于 `RPC_SEND_ALL`。
+* **分派策略：** `RPC_SEND_ALL` —— 请求发给所有已注册的执行方（`retnum = num_all`）；`RPC_SEND_FIRST` —— 发给第一个可用的（`retnum = 1`）；`RPC_SEND_LAST` —— 发给遍历 `main_block` / `ext_block` 时的最后一个；`RPC_SEND_RR` —— 按轮询发给一个执行方（原子计数器 `req_send_rr`）。
 * **部分成功：** 若实际发出的请求数少于执行方数量，则期望的应答数相应下调；若一个都没发出去——调用方收到 `-ENOTAVAILABLE`。
-* **超时：** 等待应答采用循环 `sem_timedwait`，步长 1 秒，并重新统计已收到的应答。超时后调用方得到 `-ETIMEDOUT`。
+* **超时：** 等待应答是循环调用 `libsrpc_sem_wait_timeout_us`，每次唤醒后重新统计已就绪的槽位。间隔以微秒设置：`libsrpc_timeout_oneshot_set()`（下一次调用）、`libsrpc_timeout_func_set()`（指定函数）、`libsrpc_timeout_global_set()`（所有调用）；默认 `LIBSRPC_TIMEOUT_DEFAULT`（1 秒），下限 `LIBSRPC_TIMEOUT_MINIMUM`（100 微秒）。若在该间隔内未收齐应答，空槽被标记为 `-ERPCWAITIMEDOUT`。
 
 ### 10. 递归防护与错误处理
 * **TLS 标志：** 执行方线程中设置了 `srpc_disable_rpc_recursion`，因此执行方不能自行发起 RPC 调用——尝试将返回 `-ERECURSIVE`。
 * **调度器中的检查：** 调用前比较 `&name` 与 `&sRPCFN(name)` 的地址；若相等，说明该进程在没有本地实现的情况下进入了注册表，桩函数将会调用自身。
-* **错误码：** `libsrpc` 以自身错误码扩展系统 `errno`，编号紧随 `MAX_ERRNO` 之后：`ELIBNOINIT`、`ESHMNOINIT`、`ERPCDISABLE`、`ENOREGFUN`、`ERECURSIVE`、`ECANCELLED`、`ENOTAVAILABLE`。它们存于 TLS 变量中，经 `libsrpc_errno_get()` 获取（`void` 函数无法返回错误码，故需要它），并由 `libsrpc_strerror()` 解码。
+* **错误码：** `libsrpc` 以自身错误码扩展系统 `errno`，编号紧随 `MAX_ERRNO` 之后：`ELIBNOINIT`、`ESHMNOINIT`、`ERPCDISABLE`、`ENOREGFUN`、`ERECURSIVE`、`ECANCELLED`、`ENOTAVAILABLE`、`ERPCWAITIMEDOUT`。它们存于 TLS 变量中，经 `libsrpc_errno_get()` 获取（`void` 函数无法返回错误码，故需要它），并由 `libsrpc_strerror()` 解码。
 
 ## 🔄 RPC 调用的生命周期
 

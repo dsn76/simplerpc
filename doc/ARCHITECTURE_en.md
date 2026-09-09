@@ -43,7 +43,7 @@ Used exclusively for signaling, function registration, and connection establishm
 * **Ownership Model (UID):** each block header contains a `uid[12]` array. A block is returned to the pool only when all its owners have detached it. `libsrpc` passes the allocator the `proc_uid` — a 16-bit process identifier issued by the daemon (`DAEMON_PROC_UID = 1` for the daemon itself). The `libsrpc_shmem_link()` function lets a process add itself as an owner of a foreign block, protecting it from being freed.
 * **Block Typing:** a 15-bit `data_type` field in the block header holds one of the `libsrpc_shm_data_type_t` types: `USER` (application data), `PROC` (process descriptor), `REGFN` (function registry block), `REQUEST` (RPC request block). The garbage collector and destructors use this field to tell user memory apart from service memory.
 * **Deferred-Cleanup Flag (`dc`):** 1 bit in the same header field. It serves as a retire mark: "the block is logically dead, but it cannot be freed right now". Set via `libsrpc_shmem_free_dc()` (= `tlsf_setdc()`), read by the garbage collector.
-* **Allocator Hijacking (optional):** the library can intercept the standard functions `malloc`, `calloc`, `realloc`, and `free`, obtaining the originals via `dlsym(RTLD_NEXT)`. Using `Thread Local Storage` (TLS), a thread switches between the system allocator and the shared-memory allocator "on the fly" (`srpc_alloc_sw_std()` / `srpc_alloc_sw_shm()`). By default this whole code path is excluded from the build via `DISABLE_ALLOC=ON`.
+* **Allocator Hijacking (optional):** the library can intercept the standard functions `malloc`, `calloc`, `realloc`, and `free`, obtaining the originals via `dlsym(RTLD_NEXT)`. Using `Thread Local Storage` (TLS), a thread switches between the system allocator and the shared-memory allocator "on the fly" (`libsrpc_alloc_sw_std()` / `libsrpc_alloc_sw_shm()`). By default this whole code path is excluded from the build via `DISABLE_ALLOC=ON`.
 
 ### 4. Garbage Collector (Shared Memory GC)
 A separate thread living **only in the daemon** (initialized from `libsrpc_shmem_create()`) is responsible for reclaiming service structures that cannot be freed immediately because of possible readers in other processes.
@@ -90,14 +90,14 @@ The `libsrpc_proc_t` structure is created by the daemon in shared memory for eve
 * **Signature and status:** `sign` (`LIBSRPC_PROC_SIGN`) and `status` are atomic. The `libsrpc_proc_is_valid()` function requires a correct signature and the `RUN` status, so invalidating a process is instantly visible to everyone else, without locks.
 * **`proc_uid`:** a 16-bit identifier issued by the daemon; used as the owner UID in the TLSF allocator.
 * **Queue and semaphore:** each process has its own MPMC queue and a single wake-up semaphore `sem_wakeup` for all its executor threads.
-* **Thread array:** `threads[]` is placed in the same memory block, sized by the number of online CPUs (`sysconf(_SC_NPROCESSORS_ONLN)`). Each element contains `hp_req` — a Hazard Pointer to the request being processed.
+* **Thread array:** `threads[]` is placed in the same memory block, sized by the number of online CPUs (`sysconf(_SC_NPROCESSORS_ONLN)`). Workers themselves are started according to the `sched_getaffinity` mask (`pthread_start_all_cpu`). Each element contains `hp_req` — a Hazard Pointer to the request being processed.
 * **Request list:** `req_head` — the list of all the process's request blocks, for the garbage collector's walk.
 
 ### 8. Synchronization and Queues
 The custom futex implementation (`libsrpc_futex.*`) that was present in version 0.1.x has been removed; synchronization is built on POSIX primitives in shared memory.
 
-* **MPMC Queue:** a lock-free bounded Multi-Producer Multi-Consumer queue (Vyukov scheme: an array of cells with a `sequence` counter), placed in shared memory. Used to hand tasks from the client to the executor's workers. Cells are cache-line aligned, and `enqueue_pos` and `dequeue_pos` are separated onto different lines. The capacity is a power of two, set at build time (`MPMCQ_DEGREE`, default `2^10 = 1024`). The cell holds not the request itself, but a pointer to it in shared memory plus the response slot index.
-* **POSIX Semaphores:** `sem_t` semaphores initialized with `pshared = 1` and placed in shared memory are used to sleep and wake worker threads when the queues have no tasks (CPU savings). They are wrapped by a thin `libsrpc_sem_*` layer (`libsrpc_wrapper.h`) so the implementation can be replaced if needed. Wake-ups are economical: `sem_post` is called only if the process has waiting threads.
+* **MPMC Queue:** the lock-free `lf_mpmc_queue` (Vyukov scheme: an array of cells with a `seq` counter), placed in shared memory inside `libsrpc_proc_t`. Used to hand tasks from the client to the executor's workers. Cells are cache-line aligned (`alignas(64)`), and `head` and `tail` are separated onto different lines. The capacity is a power of two, set at build time (`MPMCQ_DEGREE`, default `2^10 = 1024`). The cell holds only a pointer to the `libsrpc_request_t` in shared memory; the worker finds its response slot via `resp->hp_proc`.
+* **POSIX Semaphores:** `sem_t` semaphores initialized with `pshared = 1` and placed in shared memory are used to sleep and wake worker threads when the queues have no tasks (CPU savings). They are wrapped by a thin `libsrpc_sem_*` layer (`libsrpc_wrapper.h`) so the implementation can be replaced if needed. Wake-ups are economical: `sem_post` is called if there are waiting threads (`threads_wait > 0`) or the process has exactly one worker (`threads_run == 1`).
 * **Semaphore in the request body:** every `libsrpc_request_t` contains its own `sem_wakeup` — the executor uses it to notify the calling thread of a ready response. This replaced the "Job Futex" of earlier versions.
 * **Spinlock list:** `libsrpc_list_spin` — a singly linked list, writes under a `pthread_spinlock_t`, lock-free traversal via atomic loads with `acquire`. Used for the process list and the request list.
 * **Fixed-size block pool:** `libsrpc_fixblockalloc` — a fast pool on a FIFO index ring with automatic growth (`nextpool`), used by the daemon for client-connection descriptors in *local* (not shared) memory. It has no synchronization and is designed for single-threaded use — accesses come only from the daemon's main `epoll` loop.
@@ -107,30 +107,31 @@ A single block in shared memory contains both the request and all its responses,
 
 ```text
 libsrpc_request_t
-+----------------------------------------------------------+
-| node | sem_wakeup | sign | funid | bufsz | retoff | retsz | retnum |
-+----------------------------------------------------------+
-| buf[]:                                                   |
-|   [arguments .......]  <- retoff = ALIGNLONG(len(args))   |
-|   [libsrpc_response_t #0][ret]  <- each of size retsz     |
-|   [libsrpc_response_t #1][ret]                            |
-|   ...                          <- retnum slots            |
-+----------------------------------------------------------+
++----------------------------------------------------------------------+
+| node | sem_wakeup | hp_regfn | sign | seq_num | funid | bufsz |      |
+| retoff | retsz | retnum |                                            |
++----------------------------------------------------------------------+
+| buf[]:                                                               |
+|   [arguments .......]  <- retoff = ALIGNLONG(len(args))               |
+|   [libsrpc_response_t #0][ret]  <- each of size retsz                 |
+|   [libsrpc_response_t #1][ret]                                        |
+|   ...                          <- retnum slots                        |
++----------------------------------------------------------------------+
 
 libsrpc_response_t: { hp_proc (who we wait for), rc, buf[] }
 ```
 
 * **Request block caching:** the pointer to the last block is kept in TLS (`current_req`). If the new request fits — the block is reused without touching the allocator; if not — it is freed and a new one is allocated at twice the size. On the hot path the allocator is never called at all. The same pointer serves `libsrpc_lastreq_num()` / `libsrpc_lastreq_get()`.
-* **Readiness protocol:** the executor writes into `resp->rc` either the flag `LIBSRPC_RC_FLAG_READY` (`0x80000000`) or a negative error code. The client considers a response valid only on an exact match with the flag.
+* **Readiness protocol:** the executor first sets `LIBSRPC_RC_FLAG_LOCK` (`0xC0000000`), copies the result, and publishes `LIBSRPC_RC_FLAG_READY` (`0x80000000`), or writes a negative error code. In the wrapper, the client considers a response valid only on an exact match with the ready flag.
 * **Validation:** `libsrpc_req_is_corrupted()` checks the signature (double-read with `acquire` before and after reading the fields) and the consistency of the sizes. `libsrpc_req_destroy()` clears the signature via CAS, so a double destroy is safe — this protects against use-after-free when the GC and an executor work concurrently.
-* **Dispatch policy:** `RPC_SEND_ALL` — the request goes to all registered executors (`retnum = num_all`), `RPC_SEND_FIRST` — only to the first available one (`retnum = 1`). The values `RPC_SEND_LAST` and `RPC_SEND_RR` are declared in the API but not implemented yet and behave as `RPC_SEND_ALL`.
+* **Dispatch policy:** `RPC_SEND_ALL` — the request goes to all registered executors (`retnum = num_all`); `RPC_SEND_FIRST` — to the first available one (`retnum = 1`); `RPC_SEND_LAST` — to the last one in the `main_block` / `ext_block` walk; `RPC_SEND_RR` — to one executor in round-robin (atomic counter `req_send_rr`).
 * **Partial success:** if fewer requests were dispatched than there are executors, the expected number of responses is lowered; if none at all — the caller gets `-ENOTAVAILABLE`.
-* **Timeout:** waiting for responses is a cyclic `sem_timedwait` with a 1-second step and re-counting of received responses. After the timeout expires the caller gets `-ETIMEDOUT`.
+* **Timeout:** waiting for responses is a `libsrpc_sem_wait_timeout_us` loop that re-counts ready slots after every wake-up. The interval is set in microseconds: `libsrpc_timeout_oneshot_set()` (the next call), `libsrpc_timeout_func_set()` (a function), `libsrpc_timeout_global_set()` (all calls); the default is `LIBSRPC_TIMEOUT_DEFAULT` (1 s), the lower bound is `LIBSRPC_TIMEOUT_MINIMUM` (100 µs). If the responses are not collected within the interval, the empty slots are marked `-ERPCWAITIMEDOUT`.
 
 ### 10. Recursion Protection and Error Handling
 * **TLS flag:** executor threads have `srpc_disable_rpc_recursion` set, so an executor cannot initiate an RPC call itself — an attempt returns `-ERECURSIVE`.
 * **Check in the dispatcher:** before the call, the addresses `&name` and `&sRPCFN(name)` are compared; if they match, the process ended up in the registry without a local implementation and the stub would call itself.
-* **Error codes:** `libsrpc` extends the system `errno` with its own codes starting after `MAX_ERRNO`: `ELIBNOINIT`, `ESHMNOINIT`, `ERPCDISABLE`, `ENOREGFUN`, `ERECURSIVE`, `ECANCELLED`, `ENOTAVAILABLE`. They are stored in a TLS variable, available via `libsrpc_errno_get()` (needed for `void` functions that cannot return a code) and decoded by `libsrpc_strerror()`.
+* **Error codes:** `libsrpc` extends the system `errno` with its own codes starting after `MAX_ERRNO`: `ELIBNOINIT`, `ESHMNOINIT`, `ERPCDISABLE`, `ENOREGFUN`, `ERECURSIVE`, `ECANCELLED`, `ENOTAVAILABLE`, `ERPCWAITIMEDOUT`. They are stored in a TLS variable, available via `libsrpc_errno_get()` (needed for `void` functions that cannot return a code) and decoded by `libsrpc_strerror()`.
 
 ## 🔄 Lifecycle of an RPC Call
 

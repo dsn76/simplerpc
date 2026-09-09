@@ -26,7 +26,7 @@
 - **内存所有权模型：** 内存池中的每个块都带有属主进程的 UID 标记（每块最多 12 个属主）。进程断开时，守护进程自动释放其名下所有块。
 - **垃圾回收器：** 守护进程中的后台 GC 线程回收被标记为延迟清理的服务块，并通过 Hazard Pointer 检查其占用情况。
 - **RPC 函数的动态链接：** 进程向守护进程发送自己能够执行的函数的位图；守护进程将其注册进共享内存中的无锁注册表。
-- **多播：** 一次调用可由所有已注册进程执行（`RPC_SEND_ALL`），或仅由第一个进程执行（`RPC_SEND_FIRST`）；结果通过 `libsrpc_lastreq_num()` / `libsrpc_lastreq_get()` 收集。
+- **多播：** 一次调用可由所有已注册进程执行（`RPC_SEND_ALL`）、仅由第一个进程执行（`RPC_SEND_FIRST`）、仅由最后一个进程执行（`RPC_SEND_LAST`），或按轮询执行（`RPC_SEND_RR`）；结果通过 `libsrpc_lastreq_num()` / `libsrpc_lastreq_get()` 收集。
 - **同步与队列：** 每进程一条无锁 MPMC 队列，以及共享内存中的 POSIX 信号量，用于执行方线程的休眠/唤醒。
 - **嵌入式加载器（Embedded Loader）：** 库内部静态编译的加载器，通过 `fexecve()` 从 `memfd` 启动守护进程——磁盘上无文件。
 - **可选的分配器替换：** 拦截 `malloc`/`calloc`/`realloc`/`free`，可"热切换"到共享内存池（默认关闭，见 `DISABLE_ALLOC`）。
@@ -61,10 +61,11 @@ simplerpc/
 │   ├── libsrpc_shmem.c         # 共享内存与分配器管理
 │   ├── libsrpc_shm_gc.c        # 共享内存垃圾回收器
 │   ├── libsrpc_proc.c          # 共享内存中的进程描述符
-│   ├── libsrpc_mpmcq.c         # 无锁 MPMC 请求队列
+│   ├── lf_mpmc_queue.c         # 无锁 MPMC 请求队列
 │   ├── libsrpc_list_spin.c     # 单链表（写操作用自旋锁）
 │   ├── libsrpc_fixblockalloc.c # 定长块池（本地内存）
 │   ├── libsrpc_pthread.c       # 线程创建封装、CPU 绑定
+│   ├── libsrpc_wrapper.h       # POSIX 信号量封装（pshared）
 │   ├── libsrpc_errno.c         # libsrpc 错误码与错误字符串
 │   ├── libsrpc_local.h         # 内部结构：上下文、请求、应答
 │   ├── libsrpc_private.h       # RPC 标识符与函数注册表
@@ -149,7 +150,7 @@ cmake -DBUILD_TYPE=debug -DDBG_LVL=3 -DSHMEM_SIZE_KB=16384 ..
     XF(RPC_SEND_ALL, void,  all_exit) \
 ```
 
-格式：`XF(分派策略, 返回类型, 名称, 参数类型...)`。不允许可变参数函数。
+格式：`XF(分派策略, 返回类型, 名称, 参数类型...)`。策略：`RPC_SEND_ALL`、`RPC_SEND_FIRST`、`RPC_SEND_LAST`、`RPC_SEND_RR`。不允许可变参数函数。
 
 ### 谁是执行方，谁是调用方
 
@@ -179,6 +180,8 @@ libsrpc_shmem_free(str);
 ```
 
 > 传给 RPC 函数的指针必须指向共享池（`libsrpc_shmem_malloc`）——库只拷贝参数本身，不拷贝指针所指向的数据。
+
+> 等待应答的超时以微秒为单位设置：`libsrpc_timeout_oneshot_set()`（下一次调用）、`libsrpc_timeout_func_set()`（指定函数）、`libsrpc_timeout_global_set()`（所有调用）。默认 1 秒。
 
 > 链接一个**仅**导出 RPC 函数的应用时，必须加 `-Wl,--no-as-needed` 标志：若没有对 `libsrpc.so` 符号的引用，链接器会丢弃 `DT_NEEDED`，库的构造函数便不会执行。
 

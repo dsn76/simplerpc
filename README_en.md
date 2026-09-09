@@ -26,7 +26,7 @@ The project's distinguishing feature is the **absence of an IDL and a code gener
 - **Memory ownership model:** Every block in the pool is tagged with the UID of its owner process (up to 12 owners per block). When a process disconnects, the daemon automatically frees all of its blocks.
 - **Garbage collector:** A background GC thread in the daemon reclaims service blocks marked for deferred cleanup, checking their occupancy via Hazard Pointers.
 - **Dynamic linking of RPC functions:** A process sends the daemon a bitmap of the functions it can execute; the daemon registers it in a lock-free registry in shared memory.
-- **Multicast:** A single call can be executed by all registered processes (`RPC_SEND_ALL`) or by the first one only (`RPC_SEND_FIRST`); the results are collected via `libsrpc_lastreq_num()` / `libsrpc_lastreq_get()`.
+- **Multicast:** A single call can be executed by all registered processes (`RPC_SEND_ALL`), by the first one only (`RPC_SEND_FIRST`), by the last one only (`RPC_SEND_LAST`), or in round-robin (`RPC_SEND_RR`); the results are collected via `libsrpc_lastreq_num()` / `libsrpc_lastreq_get()`.
 - **Synchronization and queues:** A lock-free MPMC queue per process and POSIX semaphores in shared memory for sleeping/waking executor threads.
 - **Embedded Loader:** A statically compiled loader inside the library starts the daemon from a `memfd` via `fexecve()` — no file on disk.
 - **Optional allocator substitution:** Interception of `malloc`/`calloc`/`realloc`/`free` with an "on-the-fly" switch to the shared-memory pool (disabled by default, see `DISABLE_ALLOC`).
@@ -61,10 +61,11 @@ simplerpc/
 │   ├── libsrpc_shmem.c         # Shared-memory and allocator management
 │   ├── libsrpc_shm_gc.c        # Shared-memory garbage collector
 │   ├── libsrpc_proc.c          # Process descriptors in shared memory
-│   ├── libsrpc_mpmcq.c         # Lock-free MPMC request queue
+│   ├── lf_mpmc_queue.c         # Lock-free MPMC request queue
 │   ├── libsrpc_list_spin.c     # Singly linked list (spinlock on write)
 │   ├── libsrpc_fixblockalloc.c # Fixed-size block pool (local)
 │   ├── libsrpc_pthread.c       # Thread-creation wrappers, CPU pinning
+│   ├── libsrpc_wrapper.h       # POSIX semaphore wrappers (pshared)
 │   ├── libsrpc_errno.c         # libsrpc error codes and strings
 │   ├── libsrpc_local.h         # Internal structures: context, request, response
 │   ├── libsrpc_private.h       # RPC identifiers and the function registry
@@ -149,7 +150,7 @@ All functions available for remote calls are listed in a single X-macro, `src/li
     XF(RPC_SEND_ALL, void,  all_exit) \
 ```
 
-Format: `XF(dispatch policy, return type, name, parameter types...)`. Functions with a variable number of parameters are not allowed.
+Format: `XF(dispatch policy, return type, name, parameter types...)`. Policy: `RPC_SEND_ALL`, `RPC_SEND_FIRST`, `RPC_SEND_LAST`, `RPC_SEND_RR`. Functions with a variable number of parameters are not allowed.
 
 ### Who Is the Executor and Who Is the Caller
 
@@ -179,6 +180,8 @@ libsrpc_shmem_free(str);
 ```
 
 > Pointers passed to RPC functions must address the shared pool (`libsrpc_shmem_malloc`) — the library copies only the arguments themselves, not the data behind the pointers.
+
+> The response wait timeout is set in microseconds: `libsrpc_timeout_oneshot_set()` (the next call), `libsrpc_timeout_func_set()` (a specific function), `libsrpc_timeout_global_set()` (all calls). The default is 1 s.
 
 > When linking an application that **only** exports RPC functions, the `-Wl,--no-as-needed` flag is mandatory: without references to `libsrpc.so` symbols the linker drops the `DT_NEEDED`, and the library's constructor will not run.
 
