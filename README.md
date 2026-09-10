@@ -3,6 +3,7 @@
 - Текущая версия 0.2.1
 - **Language:** 🇷🇺 **Русский** · 🇬🇧 [English](README_en.md) · 🇨🇳 [中文](README_zh.md)
 - [![Coverity Scan Build Status](https://scan.coverity.com/projects/33264/badge.svg)](https://scan.coverity.com/projects/simplerpc)
+- [rpcgen](../../tree/rpcgen) - Замена макросов на кодогенерацию.
 
 **simplerpc** — это легковесный и высокопроизводительный фреймворк для реализации удалённого вызова процедур (RPC) между процессами в операционной системе Linux, написанный на языке C. 
 
