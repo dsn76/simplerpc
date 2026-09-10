@@ -9,7 +9,10 @@ macro(add_example name sources_str flags libs)
 
     add_executable(${name} ${full_sources})
     target_compile_options(${name} PRIVATE ${flags})
-    target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+    target_include_directories(${name} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src
+        ${RPCGEN_DIR}
+    )
     target_link_options(${name} PRIVATE -Wl,--no-as-needed)
     target_link_libraries(${name} srpc ${libs})
     set_target_properties(${name} PROPERTIES

@@ -9,7 +9,7 @@
 ### 核心原则
 1. **零配置守护进程（Zero-Conf Daemon）：** 后台协调进程在库被任何应用加载时自动启动，并在最后一个客户端断开后退出。
 2. **内存为中心（Memory-Centric）：** 所有数据、进程描述符、函数注册表和消息队列都存放在由事务型 TLSF 分配器管理的共享内存中。
-3. **链接期分派（Link-Time Dispatch）：** 进程的角色（调用方或执行方）由链接器通过 `weak alias` 决定，而非配置或运行时注册。没有 IDL，也没有代码生成器——一切由单个 X-macro 经预处理器展开。
+3. **链接期分派（Link-Time Dispatch）：** 进程的角色（调用方或执行方）由链接器通过 `weak alias` 决定，而非配置或运行时注册。没有 IDL——函数列表是 C 原型，桩代码由 `srpc_rpcgen` 生成。
 4. **基于所有权的清理（Ownership-Based Cleanup）：** 每个内存块都带有属主进程的 UID 标记，因此对崩溃或断开的进程，其名下的一切都可以被完整回收，无需维护外部分配登记簿。
 5. **透明 IPC（可选）：** 替换标准函数（`malloc`、`free`）可使现有代码无需修改即可操作共享内存。默认通过构建选项 `DISABLE_ALLOC=ON` 关闭。
 
@@ -54,22 +54,21 @@
 * **批量释放：** 空闲块在单次 `tlsf_lock()` / `tlsf_free_nb()` × N / `tlsf_unlock()` 之下成批删除——避免为每个块都抓取跨进程互斥锁。
 * **崩溃进程善后：** 连接断开时守护进程调用 `libsrpc_proc_destroy()`，它将进程从函数注册表中移除、使其描述符失效、取消挂起的请求（`-ECANCELLED`），并调用 `tlsf_free_uid_blocks(pool, proc_uid, ...)`——按属主 UID 直接遍历堆。用户块立即释放，服务块标记 `dc` 交由 GC 处理。
 
-### 5. RPC 机制与宏（X-Macro）
-为消除样板代码，使用了 C 预处理器（`src/macro.h`、`src/argfunc.h`）。
+### 5. RPC 机制与桩代码生成
+样板代码（原型、标识符、包装器、函数表、调度器的 `switch`）由 `tools/srpc_rpcgen.c` 根据 `src/libsrpc_rpc_functions.txt` 生成一组 `*.inl`，再由 `libsrpc.h` / `libsrpc_private.h` / `libsrpc.c` 包含。
 
-* **RPC_LIST：** 位于 `src/libsrpc_rpc_functions.h` 的 X-macro，唯一的事实来源。条目格式：`XF(分派策略, 返回类型, 名称, 参数类型...)`。原型、标识符、包装器、函数表以及调度器的 `switch` 都由它展开。
+* **函数列表：** C 原型。格式：`rettype name(types...) [KEY=VALUE ...];`。默认策略为 `RPC_SEND_ALL`；否则在 `)` 之后写 `RPC_MODE=RPC_SEND_*`。用户类型通过同一文件中的 `#include` 引入。
 * **标识符：** 每个函数获得唯一 ID `sRPCFNID_<name>`（编号从 `sRPCFNID_START = 16` 起）以及注册表索引 `sRPC_ID2IDX(id)`。
-* **包装器生成：** 编译期生成桩函数（`sRPCFN(name)` → `librpcimp_<name>`），它们将参数序列化进请求缓冲区（`libsrpc_request_t`），并将其放入执行方的 MPMC 队列。
-* **分派：** 执行方一侧，宏 `M_DECL`、`M_EXTRACT`、`M_ARGNAMES` 自动把缓冲区反序列化回栈变量并调用原始函数，然后将结果拷入应答槽。
-* **按返回类型的编译期分支：** 由于 C 不允许在预处理器中比较类型，使用了仅对 `void` 定义的宏 `COMPARE_void` 的技巧：`IIF(EQUAL(rettype, void))` 针对 `void` 与非 `void` 函数展开出不同的代码（`RETDATA`）。
+* **包装器生成：** `srpc_rpcgen` 写出桩函数 `librpcimp_<name>`，它们将参数序列化进请求缓冲区（`libsrpc_request_t`），并将其放入执行方的 MPMC 队列。
+* **分派：** 执行方一侧，生成的 `switch` 把缓冲区反序列化回栈变量、调用原始函数，并将结果拷入应答槽。`void` 与非 `void` 由生成器写出不同代码。
 * **设计限制：** 不允许可变参数函数；参数按字节拷贝（`memcpy`），因此只允许标量类型和指针，且指针只有在指向共享池时才有意义。
 
 ### 6. RPC 函数的动态链接
 "谁能执行什么"的注册分四个阶段完成，既不需要 `dlsym`，也不需要运行时生成桩代码。
 
-1. **Weak alias（链接阶段）。** 对 `RPC_LIST` 中的每个函数，库声明 `__attribute__((weak, alias("librpcimp_" #name))) rettype name(...);`。若应用自行定义了该函数——强符号覆盖 alias，进程即成为**执行方**。若没有——符号解析到桩函数，进程即成为**调用方**。该决定对每个函数独立作出：同一进程可以是某些函数的执行方，同时又是另一些函数的调用方。
+1. **Weak alias（链接阶段）。** 对列表中的每个函数，库声明 `__attribute__((weak, alias("librpcimp_" #name))) rettype name(...);`。若应用自行定义了该函数——强符号覆盖 alias，进程即成为**执行方**。若没有——符号解析到桩函数，进程即成为**调用方**。该决定对每个函数独立作出：同一进程可以是某些函数的执行方，同时又是另一些函数的调用方。
 2. **位图（进程启动）。** 表 `srpc_fn[]` 为每个函数存一对地址：`.rpc`（桩函数地址）和 `.loc`（符号实际解析到的地址）。`libsrpc_bmp_func_set()` 函数比较二者并在 `srpc_bmp_func_t` 中置位——"我会执行这个"。只是两个指针的比较，没有字符串，也没有运行时解析。
-3. **传给守护进程（连接时）。** `connect` 之后、收到内存 FD 之前，位图通过 Unix socket 以 `regfn_msg_t { size, sign[32], bmp }` 消息发送给守护进程。守护进程校验大小和签名（`"simplerpc_" BUILD_TS`）——防止不同版本 `RPC_LIST` 的应用相互对接。
+3. **传给守护进程（连接时）。** `connect` 之后、收到内存 FD 之前，位图通过 Unix socket 以 `regfn_msg_t { size, sign[32], bmp }` 消息发送给守护进程。守护进程校验大小和签名（`"simplerpc_" BUILD_TS`）——防止不同版本 RPC 函数列表的应用相互对接。
 4. **注册表录入（守护进程）。** `libsrpc_reg_func_form_bmp()` 把客户端的 `libsrpc_proc_t` 指针插入位于共享内存中的 `srpc_regfn_shm_t` 注册表。客户端自身从不写注册表。
 
 **注册表结构**（`srpc_regfn_shm_t`，每个函数一条记录）：

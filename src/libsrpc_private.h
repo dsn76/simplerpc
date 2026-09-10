@@ -12,9 +12,7 @@
 /* Определение идентификаторов RPC функций */
 enum e_sRPCFNID {
     sRPCFNID_START = 16,
-    #define XF(flags,rettype,name,...)   sRPCFNID_##name,
-        RPC_LIST
-    #undef XF
+    #include "libsrpc_rpc_ids.inl"
     sRPCFNID_MAX
 };
 

@@ -17,39 +17,6 @@
 #include "libsrpc_wrapper.h"
 
 
-/* Вся эта препроцессорная магия нужна, потому что стандартизаторы Си,
- * до сих пор не осилили нормальную препроцессорную кодогенерацию для: сериализации/десериализации параметров функций,
- * полей структур, итп. Даже простой битовый циклический сдвиг - в Си отсутствует как отдельная операция.
- */
-/* ============================================================================== */
-/* Макросы для генерации аргументов функций, тела функций и размера буфера запроса. */
-/* ------------------------------------------------------------------------------ */
-#include "macro.h"
-#define M_GENARG(t,v,f) t v COMMA_IF(f)
-#define M_ARGFUN(...) EVAL(FOREACH2(M_GENARG,p,,__VA_ARGS__))
-#define M_BODYGEN(t,v,f)  memcpy(&req->buf[pos], &v, sizeof(v)); pos += sizeof(v);
-#define M_BODYFUN(...) EVAL(FOREACH2(M_BODYGEN,p,,__VA_ARGS__))
-#define M_REQSZGEN(t)  sizeof(t) +
-#define M_REQSIZE(...) EVAL(FOREACH1(M_REQSZGEN,__VA_ARGS__))
-
-/* ------------------------------------------------------------------------------ */
-// Определяем макрос сравнения ТОЛЬКО для void. 
-// Для всех остальных типов соответствующего макроса не будет.
-#define COMPARE_void(x) x
-#define IS_COMPARABLE(x) IS_PAREN(CAT(COMPARE_, x) (()))
-#define PRIMITIVE_COMPARE(x, y) IS_PAREN(COMPARE_ ## x ( COMPARE_ ## y ) ( (()) ))
-#define NOT_EQUAL(x, y) \
-    IIF(BITAND(IS_COMPARABLE(x))(IS_COMPARABLE(y))) \
-    ( \
-        PRIMITIVE_COMPARE, \
-        1 EAT \
-    )(x, y)
-#define EQUAL(x, y) COMPL(NOT_EQUAL(x, y))
-
-// return в зависимости от типа.
-#define RETDATA(type, data) EVAL(IIF(EQUAL(type,void))(return,return(*(type*)(data))))
-#define RLEN(type) IIF(EQUAL(type, void))(0, sizeof(type))
-
 #define ALIGNLONG(x) (((size_t)(x) + sizeof(long) - 1) & ~(sizeof(long) - 1))
 /* ============================================================================== */
 
@@ -466,43 +433,16 @@ static libsrpc_request_t* libsrpc_req_alloc(int funid, int reqlen, int retsz)
 }
 
 /* ------------------------------------------------------------------------------ */
-// Реализации функций, перехватывающих обёртки, для RPC вызовов.
-#define XF(flags,rettype,name,...) \
-static rettype sRPCFN(name)(M_ARGFUN(__VA_ARGS__)) { \
-    int len=0; int rlen=0; int pos=0; \
-    libsrpc_request_t *req = NULL; \
-    __libsrpc_errno_clear(); \
-    rlen = RLEN(rettype); \
-    char rbuf[rlen]; \
-    memset(rbuf, 0, rlen); \
-    len = M_REQSIZE(__VA_ARGS__) 0; \
-    req = libsrpc_req_alloc(GET_FNID(name), len, rlen); \
-    if(req == NULL) { __libsrpc_errno_set(ENOMEM); }else{ \
-      M_BODYFUN(__VA_ARGS__); \
-      if(!!req && pos != len) { __libsrpc_errno_set(EBADMSG); }else{ \
-        libsrpc_response_t *resp = libsrpc_req_get_response(req, 0); \
-        libsrpc_send_request(req, flags); \
-        libsrpc_req_response_get(resp, rbuf, rlen); \
-      } \
-    } \
-    DBG_PRINT("RPC call: %s %s(%s fnid=%d) len=%d retsz=%d\n", #rettype, #name, #__VA_ARGS__, GET_FNID(name), len, rlen); \
-    RETDATA(rettype,rbuf); \
-  }
-RPC_LIST
-#undef XF
+/* Реализации функций, перехватывающих обёртки, для RPC вызовов. */
+#include "libsrpc_rpc_wrappers.inl"
 
-// Прототипы ф-ий с атрибутом weak, для link-овки. Если функция определена в текущей приложении, будет вызвана она, иначе подмена.
-#define XF(flags,rettype,name,...) \
-  __attribute__((weak, alias("librpcimp_" #name))) \
-  rettype name(__VA_ARGS__);
-RPC_LIST
-#undef XF
+/* Прототипы с атрибутом weak: если функция определена в приложении — она,
+ * иначе подмена librpcimp_*. */
+#include "libsrpc_rpc_weak.inl"
 
-// Указатели на функции, оригинал (если есть в текущем приложении) и подмену.
+/* Указатели на функции, оригинал (если есть в приложении) и подмену. */
 static const srpc_func_t srpc_fn[sRPC_FNNUM] = {
-#define XF(flags,rettype,fname,...)  {.rpc = sRPCFN(fname), .loc = fname, .name = #fname },
-RPC_LIST
-#undef XF
+#include "libsrpc_rpc_table.inl"
 };
 
 static simplerpc_t srpc = {
@@ -510,22 +450,6 @@ static simplerpc_t srpc = {
   .fn = srpc_fn,
   .fn_sz = sRPC_FNNUM,
 };
-
-/* ============================================================================== */
-/* --- Макросы для десериализации и вызова (Callback) --- */
-
-// 1. Объявление переменных: int p1, char* p2, ...
-//#define M_DECL(t,v,f) t v COMMA_IF(f)
-#define M_DECL(t,v,f) t v;
-#define M_DECLFUN(...) EVAL(FOREACH2(M_DECL,p,,__VA_ARGS__))
-
-// 2. Извлечение из буфера: memcpy(&p1, &buf[pos], sizeof(p1)); pos += sizeof(p1); ...
-#define M_EXTRACT(t,v,f) memcpy(&v, &req->buf[pos], sizeof(v)); pos += sizeof(v);
-#define M_EXTRACTFUN(...) EVAL(FOREACH2(M_EXTRACT,p,,__VA_ARGS__))
-
-// 3. Генерация списка аргументов для вызова: p1, p2, ...
-#define M_ARGNAME(t,v,f) v COMMA_IF(f)
-#define M_ARGNAMES(...) EVAL(FOREACH2(M_ARGNAME,p,,__VA_ARGS__))
 
 /* RPC Callbacks */
 static int libsrpc_callback_func(libsrpc_request_t *req, libsrpc_response_t *resp, libsrpc_req_ctrl_t *ctrl)
@@ -535,32 +459,7 @@ static int libsrpc_callback_func(libsrpc_request_t *req, libsrpc_response_t *res
   if( !req || !resp) return(-ENOTAVAILABLE);
 
   switch(req->funid) {
-    #define XF(flags,rettype,name,...) \
-        case GET_FNID(name): \
-            /* Защита от рекурсии: если зарегистрирована сама обертка */ \
-            if ((void*)&(name) == (void*)&(sRPCFN(name))) { rc = -ERECURSIVE; break; } \
-            { \
-                int pos = 0; \
-                /* Объявляем переменные (int p, char* pp, ...) */ \
-                M_DECLFUN(__VA_ARGS__); \
-                /* Копируем данные из buf в переменные */ \
-                M_EXTRACTFUN(__VA_ARGS__); \
-                \
-                /* Вызываем функцию и обрабатываем возвращаемое значение */ \
-                IIF(EQUAL(rettype, void)) \
-                ( \
-                    /* Если void: просто вызываем */ \
-                    name(M_ARGNAMES(__VA_ARGS__)); \
-                , \
-                    /* Если не void: сохраняем результат и пишем в буфер ответов */ \
-                    rettype retval = name(M_ARGNAMES(__VA_ARGS__)); \
-                    rc = libsrpc_req_response_set(req, resp, ctrl, &retval, sizeof(retval)); \
-                ) \
-                (void)pos; \
-            } \
-            break;
-        RPC_LIST
-    #undef XF
+    #include "libsrpc_rpc_callbacks.inl"
     default:
       ERR_PRINT("srpc_callback_func: BAD FUNID: funid=%d\n", req->funid);
       rc = -EBADMSG;

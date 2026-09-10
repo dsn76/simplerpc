@@ -9,13 +9,13 @@
 本项目提供基于共享内存（Shared Memory）和 UNIX socket 的透明进程间通信（IPC）机制，并自带无锁（lock-free）原语（MPMC 队列、函数注册表）以及一个事务型共享内存分配器。
 
 ## 演示
-终端一：`./log`（可启动多个实例）。终端二：`./clc`（同上）。终端三：`./app`。第一个终端的输出中会出现 `LOG("Hello, world, from app! my pid=...")`。`app` 中的调用 `log_write("Hello")` 和 `calc_add(1, 2)` 是普通的 C 函数，但实际执行发生在 `log` 和 `clc` 进程中。函数参数的全部序列化都隐藏在 X-macro 中，无需手工编写。要在自己的应用中使用：在源码中 `#include "libsrpc.h"`，在 `./src/libsrpc_rpc_functions.h` 中声明要导出的函数原型（它是库自身源码的一部分，并非独立的公开 API 头文件），重新构建 `libsrpc.so`，并以 `-Wl,--no-as-needed` 标志链接到你的应用中。更多细节见 `./example`。
+终端一：`./log`（可启动多个实例）。终端二：`./clc`（同上）。终端三：`./app`。第一个终端的输出中会出现 `LOG("Hello, world, from app! my pid=...")`。`app` 中的调用 `log_write("Hello")` 和 `calc_add(1, 2)` 是普通的 C 函数，但实际执行发生在 `log` 和 `clc` 进程中。函数参数的全部序列化由原型列表生成，无需手工编写。要在自己的应用中使用：在源码中 `#include "libsrpc.h"`，在 `./src/libsrpc_rpc_functions.txt` 中声明要导出的函数原型（它是库自身源码的一部分，并非独立的公开 API 头文件），重新构建 `libsrpc.so`，并以 `-Wl,--no-as-needed` 标志链接到你的应用中。更多细节见 `./example`。
 
 ## 项目简介
 **simplerpc** 项目（`libsrpc` 库）是一个面向 Linux 环境、用于在不同进程间组织远程过程调用（RPC）的高性能框架。
 其架构基于：使用共享内存进行数据传输，使用 UNIX socket 进行信令交互和分发内存描述符。共享段中的内存管理由事务型 **TLSF** 分配器（`tlsf_txn` v4.1）完成，其源码包含在项目树中（`libs/tlsf_txn/`）。线程与进程间的同步建立在放置于共享内存（`pshared`）中的 POSIX 信号量之上，以及无锁结构之上：MPMC 队列（Multi-Producer Multi-Consumer）和基于 CAS 发布的函数注册表。
 
-本项目的特色之一是**没有 IDL、没有代码生成器**：进程的角色（调用方或执行方）在链接期通过 `__attribute__((weak, alias))` 确定，全部参数序列化由单个 X-macro `RPC_LIST` 经预处理器生成。第二个特色是内嵌的静态加载器（embedded loader）：它经 `xxd` 工具编译为 C 数组并集成进 `libsrpc.so` 动态库，使库能够直接从内存（而非磁盘文件）拉起后台协调进程（守护进程）。
+本项目的特色之一是**没有 IDL**：进程的角色（调用方或执行方）在链接期通过 `__attribute__((weak, alias))` 确定，全部参数序列化由 `srpc_rpcgen` 根据 `libsrpc_rpc_functions.txt` 中的 C 原型生成。第二个特色是内嵌的静态加载器（embedded loader）：它经 `xxd` 工具编译为 C 数组并集成进 `libsrpc.so` 动态库，使库能够直接从内存（而非磁盘文件）拉起后台协调进程（守护进程）。
 
 
 ## 📋 主要特性
@@ -53,7 +53,7 @@ simplerpc/
 │   └── ARCHITECTURE_zh.md      # 内部结构说明（中文）
 ├── src/                        # libsrpc 库核心源码
 │   ├── libsrpc.h               # 公开 API
-│   ├── libsrpc_rpc_functions.h # RPC_LIST X-macro —— RPC 函数列表
+│   ├── libsrpc_rpc_functions.txt # RPC 函数原型（srpc_rpcgen 输入）
 │   ├── libsrpc.c               # 包装器代码生成、调度器、函数注册表
 │   ├── libsrpc_daemon.c        # 守护进程启动（spawn）及其主循环
 │   ├── libsrpc_loader.c        # 内嵌加载器源码
@@ -68,8 +68,9 @@ simplerpc/
 │   ├── libsrpc_wrapper.h       # POSIX 信号量封装（pshared）
 │   ├── libsrpc_errno.c         # libsrpc 错误码与错误字符串
 │   ├── libsrpc_local.h         # 内部结构：上下文、请求、应答
-│   ├── libsrpc_private.h       # RPC 标识符与函数注册表
-│   └── macro.h, argfunc.h      # 预处理器代码生成
+│   └── libsrpc_private.h       # RPC 标识符与函数注册表
+├── tools/
+│   └── srpc_rpcgen.c           # RPC 桩代码生成器（*.inl）
 ├── libs/                       # 第三方源码（树内，无子模块）
 │   └── tlsf_txn/               # 事务型 TLSF 分配器 v4.1（+ 测试、README）
 ├── example/                    # 演示应用
@@ -134,27 +135,28 @@ make
 cmake -DBUILD_TYPE=debug -DDBG_LVL=3 -DSHMEM_SIZE_KB=16384 ..
 ```
 
-> **重要：** 每次 CMake 配置都会生成 `BUILD_TS` 时间戳，它构成守护进程名、抽象 socket 名和共享内存签名。使用不同构建的 `libsrpc.so` 编译出的应用**彼此无法互通**——这是防止 `RPC_LIST` 版本不兼容的保护措施。重新构建库之后，必须重启所有参与进程。
+> **重要：** 每次 CMake 配置都会生成 `BUILD_TS` 时间戳，它构成守护进程名、抽象 socket 名和共享内存签名。使用不同构建的 `libsrpc.so` 编译出的应用**彼此无法互通**——这是防止 RPC 函数列表版本不兼容的保护措施。重新构建库之后，必须重启所有参与进程。
 
 ## 💡 使用示例
 
 ### 声明 RPC 函数
 
-所有可供远程调用的函数都列在一个 X-macro 中：`src/libsrpc_rpc_functions.h`：
+所有可供远程调用的函数都列在 `src/libsrpc_rpc_functions.txt` 中。构建时 `srpc_rpcgen` 从中生成 `*.inl` 片段（包装器、弱别名、表、调度器）：
 
 ```c
-#define RPC_LIST    \
-    XF(RPC_SEND_ALL, int,   testlocal) \
-    XF(RPC_SEND_ALL, pid_t, log_write, const char*) \
-    XF(RPC_SEND_ALL, int,   calc_add, int, int) \
-    XF(RPC_SEND_ALL, void,  all_exit) \
+#include <sys/types.h>
+
+int testlocal(void);
+pid_t log_write(const char* msg);
+int calc_add(int, int);
+void all_exit(void);
 ```
 
-格式：`XF(分派策略, 返回类型, 名称, 参数类型...)`。策略：`RPC_SEND_ALL`、`RPC_SEND_FIRST`、`RPC_SEND_LAST`、`RPC_SEND_RR`。不允许可变参数函数。
+格式：`rettype name(types...) [KEY=VALUE ...];`。若 `)` 后没有内容，分派策略为 `RPC_SEND_ALL`。否则在 `;` 之前写标志，例如 `RPC_MODE=RPC_SEND_RR`。允许的值：`RPC_SEND_ALL`、`RPC_SEND_FIRST`、`RPC_SEND_LAST`、`RPC_SEND_RR`。用户类型通过 `#include` 引入。不允许可变参数函数。
 
 ### 谁是执行方，谁是调用方
 
-没有单独的"服务端" API。在自己的代码中**定义**了 `RPC_LIST` 中某个函数的进程，自动成为该函数的**执行方**——强符号覆盖 `libsrpc.so` 中的弱 alias。未定义该函数的进程，调用时得到的是桩函数，会发出 RPC 请求：
+没有单独的"服务端" API。在自己的代码中**定义**了原型列表中某个函数的进程，自动成为该函数的**执行方**——强符号覆盖 `libsrpc.so` 中的弱 alias。未定义该函数的进程，调用时得到的是桩函数，会发出 RPC 请求：
 
 ```c
 /* 执行方进程：定义了函数——即成为它的服务器。 */

@@ -14,25 +14,21 @@ typedef enum libsrpc_flag_send_rpc_s {
     RPC_SEND_RR = 3,
 } libsrpc_flag_send_rpc_t;
 
-#include "libsrpc_rpc_functions.h"
+#include "libsrpc_rpc_includes.inl"
 
 /* ------------------------------------------------------------------------------ */
 
 /* Определение идентификаторов экспортируемых RPC функций */
 typedef enum e_libsrpc_funid {
     LIBSRPC_FUNID_START = 16,
-    #define XF(flags,rettype,name,...)   libsrpc_funid_##name,
-        RPC_LIST
-    #undef XF
+    #include "libsrpc_rpc_funid.inl"
     LIBSRPC_FUNID_MAX
 } libsrpc_funid_t;
 
 /* ------------------------------------------------------------------------------ */
 
 /* Декларация RPC функций */
-#define XF(flags,rettype,name,...)   rettype name(__VA_ARGS__);
-    RPC_LIST
-#undef XF
+#include "libsrpc_rpc_decls.inl"
 
 /* ------------------------------------------------------------------------------ */
 

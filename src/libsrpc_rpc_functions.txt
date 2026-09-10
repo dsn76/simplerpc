@@ -1,0 +1,13 @@
+/* Список RPC-функций. Генератор (tools/srpc_rpcgen.c) собирает из него *.inl.
+ *
+ *   rettype name(types...) [KEY=VALUE ...];
+ *
+ * RPC_MODE по умолчанию — RPC_SEND_ALL. Другие флаги — после ')' до ';'.
+ * Пользовательские типы подключаются через #include.
+ */
+#include <sys/types.h>
+
+int testlocal(void);
+pid_t log_write(const char* msg);
+int calc_add(int, int);
+void all_exit(void);

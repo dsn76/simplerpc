@@ -84,6 +84,36 @@ target_compile_options(tlsf PRIVATE -fPIC -Wall -Wextra -Werror -Wformat ${PROJE
 target_include_directories(tlsf PUBLIC ${TLSF_DIR})
 
 # ============================================================
+# srpc_rpcgen — стабы RPC из src/libsrpc_rpc_functions.txt
+# ============================================================
+set(RPCGEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/rpcgen)
+set(RPCGEN_INL
+    ${RPCGEN_DIR}/libsrpc_rpc_includes.inl
+    ${RPCGEN_DIR}/libsrpc_rpc_funid.inl
+    ${RPCGEN_DIR}/libsrpc_rpc_decls.inl
+    ${RPCGEN_DIR}/libsrpc_rpc_ids.inl
+    ${RPCGEN_DIR}/libsrpc_rpc_wrappers.inl
+    ${RPCGEN_DIR}/libsrpc_rpc_weak.inl
+    ${RPCGEN_DIR}/libsrpc_rpc_table.inl
+    ${RPCGEN_DIR}/libsrpc_rpc_callbacks.inl
+)
+
+add_executable(srpc_rpcgen tools/srpc_rpcgen.c)
+set_target_properties(srpc_rpcgen PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED ON)
+target_compile_options(srpc_rpcgen PRIVATE -Wall -Wextra -Werror)
+
+add_custom_command(
+    OUTPUT ${RPCGEN_INL}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${RPCGEN_DIR}
+    COMMAND srpc_rpcgen
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/libsrpc_rpc_functions.txt
+            ${RPCGEN_DIR}
+    DEPENDS srpc_rpcgen ${CMAKE_CURRENT_SOURCE_DIR}/src/libsrpc_rpc_functions.txt
+    COMMENT "Generating RPC stubs from libsrpc_rpc_functions.txt"
+    VERBATIM
+)
+
+# ============================================================
 # embedded_loader.c — генерация через xxd
 # ============================================================
 set(LOADER_BIN ${CMAKE_CURRENT_BINARY_DIR}/loader)
@@ -114,15 +144,20 @@ set(SRPC_SOURCES
     src/libsrpc_list_spin.c
     src/libsrpc_proc.c
     ${EMBEDDED_LOADER}
+    ${RPCGEN_INL}
 )
 
 add_library(srpc SHARED ${SRPC_SOURCES})
+set_source_files_properties(${RPCGEN_INL} PROPERTIES HEADER_FILE_ONLY TRUE)
 target_compile_definitions(srpc PRIVATE BUILD_TS="${BUILD_TS}")
 target_compile_options(srpc PRIVATE -Wall -Wextra -Werror -fPIC ${PROJECT_C_FLAGS})
-target_include_directories(srpc PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${LIBS_DIR}
-    ${TLSF_DIR}
+target_include_directories(srpc
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${LIBS_DIR}
+        ${TLSF_DIR}
+    PUBLIC
+        ${RPCGEN_DIR}
 )
 target_link_libraries(srpc tlsf dl)
 

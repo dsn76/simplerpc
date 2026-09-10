@@ -12,6 +12,7 @@ macro(add_bench name source use_srpc)
     target_include_directories(${name} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/../src
+        ${RPCGEN_DIR}
     )
     if(${use_srpc})
         target_link_options(${name} PRIVATE -Wl,--no-as-needed)
