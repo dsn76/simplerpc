@@ -308,8 +308,8 @@ static bool bul_recover_internal(struct tlsf_ctrl *ctrl)
 {
     uint32_t top = atomic_load_explicit(&ctrl->txn.stack_top, memory_order_acquire);
     if (top == 0) return true;
-    if (top > MAX_BUL_ENTRIES) return false;
-    while (top > 0) {
+    if (top >= MAX_BUL_ENTRIES) return false;
+    while (top > 0 && top < MAX_BUL_ENTRIES) {
         top--;
         bul_record_t *rec = &ctrl->bul[top];
         if (!validate_pointer(ctrl, rec->addr)) return false;
