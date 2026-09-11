@@ -1035,11 +1035,13 @@ static void libsrpc_init() {
     srpc.real_calloc  = (void* (*)(size_t, size_t)) dlsym(RTLD_NEXT, "calloc");
     srpc.real_realloc = (void* (*)(void*, size_t)) dlsym(RTLD_NEXT, "realloc");
     srpc.real_free    = (void (*)(void*)) dlsym(RTLD_NEXT, "free");
+#ifndef LIBSRPC_DISABLE_SUBSTITUTION_ALLOCATOR
     if (!srpc.real_malloc || !srpc.real_free || !srpc.real_calloc || !srpc.real_realloc) {
         const char *error_msg = "Error loading malloc/free: dlsym failed.\n";
-        write(STDERR_FILENO, error_msg, strlen(error_msg));
+        (void)write(STDERR_FILENO, error_msg, strlen(error_msg));
         exit(1);  // Завершаем программу, если не удалось загрузить настоящие функции
     }
+#endif
     //DBG_PRINT("malloc %p:%p calloc %p:%p realloc %p:%p free %p:%p\n", srpc.real_malloc, malloc, srpc.real_calloc, calloc, srpc.real_realloc, realloc, srpc.real_free, free);
 
     DBG_PRINT("Программа %s PID=%d скомпилирована: %s\n", program_invocation_name, getpid(), BUILD_TS );

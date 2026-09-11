@@ -1,0 +1,106 @@
+name: Coverity Scan
+
+run-name: "Coverity: ${{ inputs.commit }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Commit SHA to scan"
+        required: true
+        type: string
+
+jobs:
+  coverity:
+    name: Coverity Scan
+    runs-on: ubuntu-24.04
+
+    env:
+      COVERITY_PROJECT: ${{ vars.COVERITY_PROJECT }}
+      COVERITY_SCAN_TOKEN: ${{ secrets.COVERITY_SCAN_TOKEN }}
+      COVERITY_SCAN_EMAIL: ${{ secrets.COVERITY_SCAN_EMAIL }}
+
+    steps:
+      - name: Checkout selected commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+          fetch-depth: 0
+
+      - name: Show commit
+        run: |
+          echo "Commit:"
+          git log -1 --oneline
+          echo
+          echo "SHA:"
+          git rev-parse HEAD
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            xxd \
+            curl
+
+      - name: Download Coverity Build Tool
+        run: |
+          mkdir -p "$RUNNER_TEMP/cov-analysis"
+
+          curl \
+            --fail \
+            --location \
+            --form "project=$COVERITY_PROJECT" \
+            --form "token=$COVERITY_SCAN_TOKEN" \
+            "https://scan.coverity.com/download/linux64" \
+            --output "$RUNNER_TEMP/coverity-tool.tgz"
+
+      - name: Install Coverity Build Tool
+        run: |
+          tar \
+            --extract \
+            --gzip \
+            --strip-components=1 \
+            --file="$RUNNER_TEMP/coverity-tool.tgz" \
+            --directory="$RUNNER_TEMP/cov-analysis"
+
+          echo "$RUNNER_TEMP/cov-analysis/bin" >> "$GITHUB_PATH"
+
+      - name: Configure Coverity compiler
+        run: |
+          cov-configure --gcc
+
+      - name: Build with Coverity
+        run: |
+          rm -rf cov-int build
+
+          if ! cov-build \
+              --dir cov-int \
+              make all
+          then
+            echo "Coverity build failed"
+            echo
+            echo "===== Coverity build log ====="
+            cat cov-int/build-log.txt || true
+            exit 1
+          fi
+
+      - name: Package Coverity results
+        run: |
+          tar -czf cov-int.tgz cov-int
+
+          echo "Coverity package:"
+          ls -lh cov-int.tgz
+
+      - name: Submit build to Coverity Scan
+        run: |
+          curl \
+            --fail \
+            --show-error \
+            --form "token=$COVERITY_SCAN_TOKEN" \
+            --form "email=$COVERITY_SCAN_EMAIL" \
+            --form "file=@cov-int.tgz" \
+            --form "version=$(git rev-parse HEAD)" \
+            --form "description=GitHub Actions scan $(git rev-parse HEAD)" \
+            "https://scan.coverity.com/builds?project=$COVERITY_PROJECT"

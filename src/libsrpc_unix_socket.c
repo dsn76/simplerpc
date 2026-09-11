@@ -657,7 +657,10 @@ int libsrpc_unix_client_exit(libsrpc_client_t *cli)
     DBG_PRINT("EXIT client: \n");
 
     uint64_t value = 1;
-    write(cli->efd_exit, &value, sizeof(value));
+    if(write(cli->efd_exit, &value, sizeof(value)) < 0) {
+        ERR_PRINT("write to efd_exit failed\n");
+        rc = -errno;
+    }
 
     usleep(1000);
 
