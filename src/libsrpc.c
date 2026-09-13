@@ -103,7 +103,7 @@ int libsrpc_lastreq_num(void)
   if(libsrpc_req_is_corrupted(req, NULL)) {
     return(0);
   }
-  return(req->retnum);
+  return((int)req->retnum);
 }
 
 int libsrpc_lastreq_get(int idx, void *retval, size_t sz)
@@ -120,7 +120,7 @@ int libsrpc_lastreq_get(int idx, void *retval, size_t sz)
     return(-ENOTAVAILABLE);
   }
 
-  resp = libsrpc_req_get_response(req, idx);
+  resp = libsrpc_req_get_response_fast(req, (unsigned int)idx);
   if(! resp) {
     return(-ENOTAVAILABLE);
   }
@@ -149,22 +149,30 @@ static int libsrpc_send_request_one(libsrpc_proc_t *proc, libsrpc_request_t *req
     DBG_PRINT("proc threads_run is not present\n");
     return(-ENOTAVAILABLE);
   }
-  resp = libsrpc_req_get_response(req, it);
+  resp = libsrpc_req_get_response_fast(req, it);
   if(! resp) {
     DBG_PRINT("response is not available\n");
     libsrpc_req_dump_print(req);
     return(-ENOTAVAILABLE);
   }
-  atomic_store_explicit(&resp->hp_proc, proc, memory_order_release);
   resp->rc = 0;
-  rc = lf_mpmc_queue_try_enqueue(&proc->queue, req);
+  atomic_store_explicit(&resp->hp_proc, proc, memory_order_release);
+  for(unsigned int y = 0; y < 16; y++) {
+    for(unsigned int i = 0; i < 32; i++) {
+      rc = lf_mpmc_queue_try_enqueue(&proc->queue, req);
+      if(rc == LF_QUEUE_OK) break;
+      libsrpc_cpu_pause(32);
+    }
+    if(rc == LF_QUEUE_OK) break;
+    sched_yield(); /* Если получателя вытеснили и он заблокировал очередь, подождём ... */
+  }
   if(rc != LF_QUEUE_OK) {
     resp->rc = -ENOMEM;
     ERR_PRINT("lf_mpmc_queue_try_enqueue failed rc=%d\n", rc);
     return(-ENOMEM);
   }
 
-  if(proc->threads_wait > 0 || proc->threads_run == 1) {
+  if(proc->threads_wait > 0) {
     DBG_PRINT("post sem_wakeup\n");
     libsrpc_sem_post(&proc->sem_wakeup);
   }
@@ -292,7 +300,7 @@ DBG_PRINT("send request to %d workers\n", retnum);
         /* Промаркируем пустые ответы как ошибки таймаута */
         for(unsigned int i = 0; i < retnum; i++) {
           srpc_rc_t expected = 0;
-          libsrpc_response_t *resp = libsrpc_req_get_response(req, i);
+          libsrpc_response_t *resp = libsrpc_req_get_response_fast(req, i);
           if(! resp) continue;
           atomic_compare_exchange_strong_explicit(&resp->rc, &expected, -ERPCWAITIMEDOUT, memory_order_acquire, memory_order_relaxed);
         }
@@ -306,7 +314,7 @@ DBG_PRINT("send request to %d workers\n", retnum);
 
     /* Подсчитаем полученные ответы. */
     for(unsigned int i = 0; i < retnum; i++) {
-      libsrpc_response_t *resp = libsrpc_req_get_response(req, i);
+      libsrpc_response_t *resp = libsrpc_req_get_response_fast(req, i);
       if(! resp) continue;
       if(atomic_load_explicit(&resp->hp_proc, memory_order_acquire) != NULL &&
          atomic_load_explicit(&resp->rc, memory_order_acquire) == 0) continue;
@@ -333,7 +341,7 @@ int libsrpc_req_is_busy_proc(libsrpc_request_t *req)
       if(! libsrpc_proc_is_valid(proc)) continue;
 
     /* Проверка запросов */
-    for(int i = 0; i < proc->threads_num; i++) {
+    for(unsigned int i = 0; i < proc->threads_num; i++) {
         void *hp = atomic_load_explicit(&proc->threads[i].hp_req, memory_order_acquire);
         if(hp != req) continue; /* Поток не блокирует запрос */
         return(1); /* Запрос заблокирован, сообщим вызывающему */
@@ -354,7 +362,7 @@ int libsrpc_req_is_busy(libsrpc_request_t *req)
     if(! resp) continue; /* Запрос некорректный */
     if(resp->rc != 0) continue; /* Уже ответил */
     if(! libsrpc_proc_is_valid(resp->hp_proc)) continue; /* Процесс невалидный */
-    for(int j = 0; j < resp->hp_proc->threads_num; j++) {
+    for(unsigned int j = 0; j < resp->hp_proc->threads_num; j++) {
       libsrpc_proc_thread_t *thread = &resp->hp_proc->threads[j];
       if(thread->hp_req != req) continue; /* Поток не блокирует запрос */
       return(1); /* Запрос заблокирован, сообщим вызывающему */
@@ -370,11 +378,11 @@ static int libsrpc_req_is_bad(libsrpc_request_t *req)
   if(!req) {
     return(1);
   }
-  if(libsrpc_req_is_corrupted(req, NULL)) {
-    return(1);
-  }
+  //if(libsrpc_req_is_corrupted(req, NULL)) {
+  //  return(1);
+  //}
   for(unsigned i = 0; i < req->retnum; i++) {
-    libsrpc_response_t *resp = libsrpc_req_get_response(req, i);
+    libsrpc_response_t *resp = libsrpc_req_get_response_fast(req, i);
     if(! resp) return(1);
     if((unsigned)resp->rc == LIBSRPC_RC_FLAG_LOCK ||
                resp->rc == -ERPCWAITIMEDOUT
@@ -401,14 +409,14 @@ static void libsrpc_req_free(libsrpc_request_t *req, int is_bad)
 
 static _Atomic(uint32_t) libsrpc_req_seq_num = 0;
 
-static libsrpc_request_t* libsrpc_req_alloc(int funid, int reqlen, int retsz)
+static libsrpc_request_t* libsrpc_req_alloc(int funid, unsigned int reqlen, unsigned int retsz)
 {
   libsrpc_request_t *req = NULL;
   libsrpc_shmem_t *shm = libsrpc_shmem_get();
   libsrpc_proc_t *proc = simplerpc_data->proc;
   size_t sz = 0;
-  int retnum = 0;
-  int retoff = 0;
+  unsigned int retnum = 0;
+  unsigned int retoff = 0;
 
   if(!shm) {
     __libsrpc_errno_set(ESHMNOINIT);
@@ -417,7 +425,7 @@ static libsrpc_request_t* libsrpc_req_alloc(int funid, int reqlen, int retsz)
   }
 
   srpc_regfn_shm_t *p_regfn = &shm->regfn;
-  retnum = atomic_load(&p_regfn->funcs[sRPC_ID2IDX(funid)].num_all);
+  retnum = (size_t)atomic_load(&p_regfn->funcs[sRPC_ID2IDX(funid)].num_all);
   if(retnum == 0) {
     __libsrpc_errno_set(ENOREGFUN);
     ERR_PRINT("The function '%s' is not linked\n", simplerpc_data->fn[sRPC_ID2IDX(funid)].name);
@@ -457,7 +465,7 @@ static libsrpc_request_t* libsrpc_req_alloc(int funid, int reqlen, int retsz)
 
   req->seq_num = atomic_fetch_add(&libsrpc_req_seq_num, 1);
   req->funid  = funid;
-  req->bufsz  = sz;
+  req->bufsz  = (unsigned int)sz;
   req->retoff = retoff;
   req->retsz  = retsz;
   req->retnum = retnum;
@@ -469,10 +477,11 @@ static libsrpc_request_t* libsrpc_req_alloc(int funid, int reqlen, int retsz)
 // Реализации функций, перехватывающих обёртки, для RPC вызовов.
 #define XF(flags,rettype,name,...) \
 static rettype sRPCFN(name)(M_ARGFUN(__VA_ARGS__)) { \
-    int len=0; int rlen=0; int pos=0; \
+    unsigned int len=0; unsigned int rlen=0; unsigned int pos=0; \
     libsrpc_request_t *req = NULL; \
     __libsrpc_errno_clear(); \
     rlen = RLEN(rettype); \
+    if(rlen > 32768) abort(); \
     char rbuf[rlen]; \
     memset(rbuf, 0, rlen); \
     len = M_REQSIZE(__VA_ARGS__) 0; \
@@ -480,7 +489,7 @@ static rettype sRPCFN(name)(M_ARGFUN(__VA_ARGS__)) { \
     if(req == NULL) { __libsrpc_errno_set(ENOMEM); }else{ \
       M_BODYFUN(__VA_ARGS__); \
       if(!!req && pos != len) { __libsrpc_errno_set(EBADMSG); }else{ \
-        libsrpc_response_t *resp = libsrpc_req_get_response(req, 0); \
+        libsrpc_response_t *resp = libsrpc_req_get_response_fast(req, 0); \
         libsrpc_send_request(req, flags); \
         libsrpc_req_response_get(resp, rbuf, rlen); \
       } \
@@ -540,7 +549,7 @@ static int libsrpc_callback_func(libsrpc_request_t *req, libsrpc_response_t *res
             /* Защита от рекурсии: если зарегистрирована сама обертка */ \
             if ((void*)&(name) == (void*)&(sRPCFN(name))) { rc = -ERECURSIVE; break; } \
             { \
-                int pos = 0; \
+                unsigned int pos = 0; \
                 /* Объявляем переменные (int p, char* pp, ...) */ \
                 M_DECLFUN(__VA_ARGS__); \
                 /* Копируем данные из buf в переменные */ \
@@ -602,70 +611,67 @@ static int libsrpc_request_unlock(libsrpc_proc_thread_t *thread)
   return(rc);
 }
 
-static int libsrpc_dequeue_request(libsrpc_proc_t *proc, libsrpc_proc_thread_t *thread)
+static int libsrpc_request_processing(libsrpc_request_t *req, libsrpc_proc_t *proc, libsrpc_proc_thread_t *thread)
 {
   int rc = 0;
-  libsrpc_request_t *req = NULL;
 
-  do{
-    req = NULL;
-    rc = 0;
-    if(lf_mpmc_queue_try_dequeue(&proc->queue, (void**)&req) != LF_QUEUE_OK) {
-      INF_PRINT("dequeue failed\n");
-      break;
-    }
-    if(! req) continue;
+  if(! req || ! proc || ! thread) {
+    return(-EINVAL);
+  }
 
-    if(libsrpc_req_is_corrupted(req, NULL)) {
-      ERR_PRINT("corrupted request: req=%p\n", req);
-      continue;
-    }
-    libsrpc_req_ctrl_t ctrl = atomic_load_explicit(&req->control, memory_order_acquire);
+  libsrpc_request_lock(thread, req);
 
-    libsrpc_request_lock(thread, req);
+  if(libsrpc_req_is_corrupted(req, NULL)) {
+    ERR_PRINT("corrupted request: req=%p\n", req);
+    return(-EBADMSG);
+  }
+  libsrpc_req_ctrl_t ctrl = atomic_load_explicit(&req->control, memory_order_acquire);
 
-    if(req->funid >= sRPCFNID_MAX || req->funid <= sRPCFNID_START) {
-      libsrpc_request_unlock(thread);
-      rc = -EBADMSG;
-      ERR_PRINT("BAD REQUEST: req=%p funid=%d\n", req, req->funid);
-      break;
-    }
-
-    /* Найдём свой слот для ответа на запрос. */
-    libsrpc_response_t *resp = NULL;
-    for(unsigned int i = 0; i < req->retnum; i++) {
-      resp = libsrpc_req_get_response(req, i);
-      if(! resp) continue;
-      if(atomic_load_explicit(&resp->hp_proc, memory_order_acquire) != proc) continue;
-      break;
-    }
-    if(! resp) {
-      libsrpc_request_unlock(thread);
-      rc = -EBADMSG;
-      ERR_PRINT("BAD RESPONSE: req=%p resp=%p\n", req, resp);
-      break;
-    }
-
-    INF_PRINT("dequeue success[%d]: req=%p funid=%d retsz=%d\n", sched_getcpu(), req, req->funid, req->retsz);
-
-    rc = libsrpc_callback_func(req, resp, &ctrl);
-    if((unsigned int)rc != LIBSRPC_RC_FLAG_READY) {
-      libsrpc_request_unlock(thread);
-      WRN_PRINT("callback function failed: rc=%d\n", rc);
-      break;
-    }
-  }while(1);
+  if(req->funid >= sRPCFNID_MAX || req->funid <= sRPCFNID_START) {
     libsrpc_request_unlock(thread);
+    ERR_PRINT("BAD REQUEST: req=%p funid=%d\n", req, req->funid);
+    return(-EBADMSG);
+  }
 
-  return(rc);
+  /* Найдём свой слот для ответа на запрос. */
+  libsrpc_response_t *resp = NULL;
+  for(unsigned int i = 0; i < req->retnum; i++) {
+    resp = libsrpc_req_get_response_fast(req, i);
+    if(! resp) continue;
+    if(atomic_load_explicit(&resp->hp_proc, memory_order_acquire) != proc) continue;
+    break;
+  }
+  if(! resp) {
+    libsrpc_request_unlock(thread);
+    ERR_PRINT("BAD RESPONSE: req=%p resp=%p\n", req, resp);
+    return(-EBADMSG);
+  }
+
+  INF_PRINT("dequeue success[%d]: req=%p funid=%d retsz=%d\n", sched_getcpu(), req, req->funid, req->retsz);
+
+  rc = libsrpc_callback_func(req, resp, &ctrl);
+  if((unsigned int)rc != LIBSRPC_RC_FLAG_READY) {
+    libsrpc_request_unlock(thread);
+    WRN_PRINT("callback function failed: rc=%d\n", rc);
+    return(-EBADMSG);
+  }
+
+  libsrpc_request_unlock(thread);
+
+  return(0);
 }
 
 // Функция потока приема и обработки запросов.
-static void * libsrpc_thread_rcv_req(void *arg __attribute__((unused))) {
-  int rc = 0;
-  int tid = 0;
+static void * libsrpc_thread_rcv_req(void *arg __attribute__((unused)))
+{
   libsrpc_proc_thread_t *thread = NULL;
   libsrpc_proc_t *proc = simplerpc_data->proc;
+  libsrpc_request_t *req = NULL;
+  int rc = 0;
+  unsigned int tid = 0;
+  int cnt = 0;
+  bool wait_flag = false;
+
   srpc_disable_rpc_recursion = 1;
 
   DBG_PRINT("started CPU=%d\n", sched_getcpu());
@@ -676,24 +682,42 @@ static void * libsrpc_thread_rcv_req(void *arg __attribute__((unused))) {
     return(NULL);
   }
   thread = &proc->threads[tid];
+  thread->tid = pthread_self();
 
-  while(! atomic_load_explicit(&srpc_thread_stop_flag, memory_order_acquire)) {
-    DBG_PRINT("wait for request[%d]\n", sched_getcpu());
-    atomic_fetch_add(&proc->threads_wait, 1);
-    rc = libsrpc_sem_wait(&proc->sem_wakeup);
-    atomic_fetch_sub(&proc->threads_wait, 1);
-    DBG_PRINT("sem_wait wakeup success: rc=%d\n", rc);
-    if(rc == -1 && errno == EINTR) continue;
-    if(rc == -1) {
-      ERR_PRINT("sem_wait failed: %s\n", strerror(errno));
-      break;
-    }
-    rc = libsrpc_dequeue_request(proc, thread);
-    if(rc < 0 && (unsigned)rc != -LIBSRPC_RC_FLAG_READY) {
-      ERR_PRINT("dequeue failed: rc=%d\n", rc);
-      //break;
-    }
-  }
+#define DEQUEUE_RETRY 1024
+  while(1) {
+    if(!! atomic_load_explicit(&srpc_thread_stop_flag, memory_order_acquire)) break;
+
+    while(lf_mpmc_queue_try_dequeue(&proc->queue, (void**)&req) == LF_QUEUE_OK && !! req) {
+      if(wait_flag) {
+        atomic_fetch_sub(&proc->threads_wait, 1);
+        wait_flag = false;
+      }
+      rc = libsrpc_request_processing(req, proc, thread);
+      if(rc < 0 && (unsigned)rc != -LIBSRPC_RC_FLAG_READY) {
+        ERR_PRINT("dequeue failed: rc=%d\n", rc);
+      }
+      cnt = 0;
+      req = NULL;
+    } // while dequeue
+    if(cnt++ < DEQUEUE_RETRY) {
+      libsrpc_cpu_pause(32);
+    }else{
+      if(! wait_flag) {
+        wait_flag = true;
+        atomic_fetch_add(&proc->threads_wait, 1);
+      }else{
+        rc = libsrpc_sem_wait(&proc->sem_wakeup);
+        atomic_fetch_sub(&proc->threads_wait, 1);
+        wait_flag = false;
+        if(unlikely(rc == -1 && errno == EINVAL)) {
+          ERR_PRINT("sem_wait failed: %s\n", strerror(errno));
+          break;
+        }
+      }
+    }// else cnt
+  } // while(1)
+
   atomic_fetch_sub(&proc->threads_run, 1);
 
   DBG_PRINT("stopped CPU=%d\n", sched_getcpu());
@@ -744,11 +768,11 @@ void libsrpc_thread_rcv_queue_clear(libsrpc_proc_t *proc)
 int libsrpc_thread_rcv_req_stop(void) {
   int rc = 0;
   libsrpc_proc_t *proc = simplerpc_data->proc;
-  int n = atomic_load(&proc->threads_wait) + 1;
+  unsigned int n = atomic_load(&proc->threads_wait) + 1;
 
   atomic_store(&srpc_thread_stop_flag, 1);
 
-  for(int i = 0; i < n; i++) {
+  for(unsigned int i = 0; i < n; i++) {
     libsrpc_sem_post(&proc->sem_wakeup);
   }
 
@@ -757,7 +781,7 @@ int libsrpc_thread_rcv_req_stop(void) {
 
   // Ждём пока все потоки завершатся.
   while(atomic_load_explicit(&proc->threads_run, memory_order_acquire) > 0) {
-    usleep(100);
+    libsrpc_usleep(100);
   }
 
   DBG_PRINT("send stopped\n");
@@ -780,6 +804,7 @@ void libsrpc_bmp_func_set(srpc_bmp_func_t *bmp)
   }
 }
 
+/* Функция вызывается только одинм потоком демона, иначе может быть гонка данных */
 static int libsrpc_regfn_ext_block(libsrpc_rpc_func_t *func)
 {
   size_t     sz = sizeof(srpc_regfn_ext_block_t) + (LIBSRPC_RFEB_SZ * sizeof(libsrpc_proc_t *));
@@ -796,7 +821,12 @@ static int libsrpc_regfn_ext_block(libsrpc_rpc_func_t *func)
   if(!eb) return(-ENOMEM);
 
   if(old_eb) {
-    memcpy(eb, old_eb, old_eb->size);
+    size_t szmc = old_eb->size;
+    if(szmc > sz) {
+      ERR_PRINT("szmc > sz: szmc=%zu sz=%zu\n", szmc, sz);
+      szmc = sz;
+    }
+    memcpy(eb, old_eb, szmc);
   }
 
   eb->sign = LIBSRPC_REGFN_SIGN;
@@ -833,7 +863,7 @@ static int libsrpc_regfn_insert(libsrpc_proc_t *proc, libsrpc_rpc_func_t *func, 
   }
 
   rc = -ENOMEM;
-  for(int i = 0; i < 10; i++) {
+  for(int j = 0; j < 10; j++) {
     if(!eb) rc = libsrpc_regfn_ext_block(func);
     if(rc < 0) break;
     eb = func->ext_block;

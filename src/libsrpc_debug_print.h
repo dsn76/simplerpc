@@ -6,7 +6,7 @@
 
 int sched_getcpu(void);
 
-#define DBG_PRN(fmt, ...)   do{ int sz=256; char buf[sz]; int len = snprintf(buf, sz, fmt, ##__VA_ARGS__); (void)write(STDERR_FILENO, buf, len); }while(0)
+#define DBG_PRN(fmt, ...)   do{ int sz=256; char buf[sz]; int len = snprintf(buf, sz, fmt, ##__VA_ARGS__); if(len < 0) len = 0; if(len >= sz) len = sz - 1; ssize_t rz = write(STDERR_FILENO, buf, len); (void)rz; }while(0)
 
 #ifdef DEBUG
 #define DBG_PRINT(fmt, ...) fprintf(stderr, "DBG[%d][%d]%s(): " fmt, getpid(), sched_getcpu(), __func__, ##__VA_ARGS__)

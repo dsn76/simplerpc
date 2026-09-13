@@ -25,7 +25,7 @@ enum e_sRPCFNID {
 #define sRPCFN(name)    librpcimp_##name
 #define sRPC_FNNUM      (sRPCFNID_MAX - sRPCFNID_START - 1)
 #define sRPC_IDX2ID(idx)   ((idx) + sRPCFNID_START + 1)
-#define sRPC_ID2IDX(id)   ((id) - sRPCFNID_START - 1)
+#define sRPC_ID2IDX(id)   ((int)(id) - sRPCFNID_START - 1)
 #define sRPC_BmpFuncSz   (((sRPC_FNNUM)+63) / 64) /* размер битовой карты для хранения функций. */
 
 /* ------------------------------------------------------------------------------ */
@@ -50,11 +50,11 @@ typedef struct libsrpc_rpc_func_s libsrpc_rpc_func_t;
 /* Структура для регистрации и вызова RPC функций через разделяемую память */
 typedef struct srpc_regfn_shm_s {
     struct libsrpc_rpc_func_s {
-        atomic_int                          num_all; // Общее количество зарегистрированных процессов для вызова этой RPC функции.
+        _Atomic(unsigned int)               num_all; // Общее количество зарегистрированных процессов для вызова этой RPC функции.
         _Atomic(srpc_regfn_ext_block_t *)   ext_block; // указатель на следующую структуру в списке.
         srpc_regfn_main_block_t             main_block; // блок регистрации процессов для вызова этой RPC функции.
     } funcs[sRPC_FNNUM];
-    atomic_int req_send_rr[sRPC_FNNUM]; // Счётчики отправки запросов в RR режиме.
+     _Atomic(unsigned int) req_send_rr[sRPC_FNNUM]; // Счётчики отправки запросов в RR режиме.
 } srpc_regfn_shm_t;
 
 typedef struct srpc_bmp_func_s {

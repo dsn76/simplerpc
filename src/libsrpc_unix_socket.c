@@ -127,7 +127,7 @@ static int libsrpc_unix_scoket_server_create(const char *name)
     /* abstract socket: first byte = '\0' */
     strncpy(addr.sun_path + 1, name, sizeof(addr.sun_path) - 2);
 
-    socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(name);
+    socklen_t len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + strlen(name));
 
 /*    if (connect(sck, (struct sockaddr*)&addr, len) < 0) {
         goto err;
@@ -174,7 +174,7 @@ static int send_fd(int sock, int fd_to_send)
 
     msg.msg_controllen = cmsg->cmsg_len;
 
-    return sendmsg(sock, &msg, 0);
+    return (int)sendmsg(sock, &msg, 0);
 }
 
 static int libsrpc_unix_client_worker(libsrpc_server_t *srv, libsrpc_epoll_t *ed, struct epoll_event *ev)
@@ -461,14 +461,14 @@ static int libsrpc_unix_socket_client_create(const char *name)
 
     addr.sun_family = AF_UNIX;
     /* abstract socket: first byte = '\0' */
-    strncpy(addr.sun_path + 1, name, sizeof(addr.sun_path) - 2);
+    strncpy(addr.sun_path + 1U, name, sizeof(addr.sun_path) - 2U);
 
-    socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(name);
+    socklen_t len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1U + strlen(name));
 
     for(int i = 0; i < 10000; i++) {
         rc = connect(sck, (struct sockaddr*)&addr, len);
         if(rc < 0) {
-            if(errno == ECONNREFUSED) { usleep(100); continue; }
+            if(errno == ECONNREFUSED) { libsrpc_usleep(100); continue; }
         }
         break;
     }
@@ -590,7 +590,7 @@ static void *unix_client(void *arg)
         }
         if (ev.events & (EPOLLHUP | EPOLLRDHUP)) goto err;
         if (ev.events & EPOLLIN) {
-            rc = recv(ev.data.fd, buf, sizeof(buf), MSG_DONTWAIT);
+            rc = (int)recv(ev.data.fd, buf, sizeof(buf), MSG_DONTWAIT);
             if(rc < 0) {
                 ERR_PRINT("recv failed\n");
                 goto err;
@@ -662,7 +662,7 @@ int libsrpc_unix_client_exit(libsrpc_client_t *cli)
         rc = -errno;
     }
 
-    usleep(1000);
+    libsrpc_usleep(1000);
 
     DBG_PRINT("EXIT client: END\n");
     return(rc);

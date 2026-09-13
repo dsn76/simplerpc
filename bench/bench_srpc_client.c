@@ -4,8 +4,10 @@
  *   1) локальный вызов функции того же профиля (базовая линия);
  *   2) glibc malloc/free 64 байта;
  *   3) libsrpc_shmem_malloc/free 64 байта в разделяемом пуле;
- *   4) полный round-trip RPC в одном потоке;
- *   5) round-trip RPC из нескольких потоков одновременно (пропускная способность).
+ *   4) прогрев RPC-канала;
+ *   5) одиночные запросы с паузой 0.01 с: min/макс/среднее время;
+ *   6) полный round-trip RPC в одном потоке;
+ *   7) round-trip RPC из нескольких потоков одновременно (пропускная способность).
  *
  * Использование: bench_srpc_client [итераций] [потоков] [итераций_на_поток]
  */
@@ -99,7 +101,7 @@ int main(int ac, char **av)
     }
     bench_report("shmem malloc+free 64Б", s, iters, 0);
 
-    /* 4. Прогрев и однопоточный round-trip RPC. */
+    /* 4. Прогрев RPC-канала. */
     for (int i = 0; i < 100; i++) {
         if (calc_add(1, 2) != 3) {
             printf("ОШИБКА: экспортёр calc_add не найден (errno=%d %s)\n",
@@ -108,6 +110,29 @@ int main(int ac, char **av)
         }
     }
 
+    /* 5. Одиночные запросы с паузой 0.01 с (низкая нагрузка). */
+    size_t nslow = 100;
+    uint64_t *slow = calloc(nslow, sizeof(*slow));
+    if (!slow) return 1;
+
+    size_t okslow = 0;
+    for (size_t i = 0; i < nslow; i++) {
+        usleep(10 * 1000);
+        uint64_t t0 = bench_now_ns();
+        int r = calc_add(1, 2);
+        uint64_t t1 = bench_now_ns();
+        if (r != 3) {
+            printf("ВНИМАНИЕ: запрос %zu вернул %d (errno=%d %s) — замер прерван\n",
+                   i, r, libsrpc_errno, libsrpc_strerror(libsrpc_errno));
+            break;
+        }
+        slow[i] = t1 - t0;
+        okslow++;
+    }
+    bench_report("sRPC round-trip пауза 0.01с", slow, okslow, 0);
+    free(slow);
+
+    /* 6. Однопоточный round-trip RPC. */
     size_t ok = 0;
     uint64_t wall0 = bench_now_ns();
     for (size_t i = 0; i < iters; i++) {
@@ -123,9 +148,9 @@ int main(int ac, char **av)
         ok++;
     }
     uint64_t wall1 = bench_now_ns();
-    bench_report("sRPC round-trip 1 поток", s, ok, wall1 - wall0);
+    bench_report("sRPC round-trip 1 поток ", s, ok, wall1 - wall0);
 
-    /* 5. Многопоточная нагрузка на одного экспортёра. */
+    /* 7. Многопоточная нагрузка на одного экспортёра. */
     pthread_t *tid = calloc(nthreads, sizeof(*tid));
     thread_ctx_t *ctx = calloc(nthreads, sizeof(*ctx));
     if (!tid || !ctx) return 1;

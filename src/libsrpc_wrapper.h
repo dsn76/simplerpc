@@ -1,6 +1,7 @@
 #ifndef FILE_LIBSRPC_WRAPPER_H
 #define FILE_LIBSRPC_WRAPPER_H
 
+#include <stdlib.h>
 #include <semaphore.h>
 #include <time.h>
 
@@ -54,14 +55,50 @@ static inline int libsrpc_sem_wait_timeout_us(libsrpc_sem_t *sem, uint64_t timeo
 {
     struct timespec ts = {0};
     clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += timeout / 1000000ULL;
-    ts.tv_nsec += (timeout % 1000000ULL) * 1000ULL;
+    ts.tv_sec += (time_t)(timeout / 1000000U);
+    ts.tv_nsec += (long)((timeout % 1000000U) * 1000U);
     if (ts.tv_nsec >= 1000000000L) {
         ts.tv_sec++;
         ts.tv_nsec -= 1000000000L;
     }
     return sem_timedwait(sem, &ts);
 }
+
+static inline void libsrpc_cpu_pause(unsigned long long num)
+{
+    for(unsigned long long i = 0; i < num; i++) {
+        __builtin_ia32_pause(); // TODO: add other architectures
+    }
+}
+
+static inline int libsrpc_usleep(unsigned int us)
+{
+    struct timespec ts = {0};
+    ts.tv_sec = (time_t)(us / 1000000U);
+    ts.tv_nsec = (long)((us % 1000000U) * 1000U);
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000L;
+    }
+    return nanosleep(&ts, NULL);
+}
+
+static inline unsigned int libsrpc_get_random(void)
+{
+    unsigned int rnd = 0;
+    if(! __builtin_ia32_rdrand32_step(&rnd)) {  // Требуется флаг компилятора -mrdrnd
+        rnd = (unsigned int)rand();
+    }
+    return (rnd);
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+    #define likely(x)   __builtin_expect(!!(x), 1)
+    #define unlikely(x) __builtin_expect(!!(x), 0)
+#else
+    #define likely(x)   (x)
+    #define unlikely(x) (x)
+#endif
 
 
 #endif // FILE_LIBSRPC_WRAPPER_H

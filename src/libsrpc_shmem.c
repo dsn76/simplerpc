@@ -35,7 +35,7 @@ int libsrpc_shmem_create(libsrpc_shmem_pool_t *pool, char *name, size_t size, ui
         goto err;
     }
 
-    if (ftruncate(pool->shm_fd, size) < 0) {
+    if (ftruncate(pool->shm_fd, (off_t)size) < 0) {
         rc = -errno;
         ERR_PRINT("ftruncate failed: %s\n", strerror(errno));
         goto err;
@@ -107,7 +107,7 @@ int libsrpc_shmem_open(libsrpc_shmem_pool_t *pool, int shm_fd, uintptr_t virtadd
         goto err;
     }
 
-    size = st.st_size;
+    size = (size_t)st.st_size;
 
     shm = mmap( (void*)virtaddr, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED_NOREPLACE, shm_fd, 0);
     if (shm == MAP_FAILED) {

@@ -138,7 +138,9 @@ static int destructor_fn(tlsf_t tlsf, void *ptr, block_header_t *block, uint16_t
     }
 
     data_type = tlsf_get_data_type(tlsf, ptr);
+    if(data_type < 0) data_type = 0;
     flag_dc = tlsf_getdc(tlsf, ptr);
+    if(flag_dc < 0) flag_dc = 0;
 
     DBG_PRINT("!!! GC: ptr=%p, match_uid=%d, data_type=%d\n", ptr, match_uid, data_type);
 
@@ -148,7 +150,7 @@ static int destructor_fn(tlsf_t tlsf, void *ptr, block_header_t *block, uint16_t
         case LIBSRPC_SHMDT_REQUEST:
             if(flag_dc) { // Специальные блоки в отложенную очистку.
                 pool->elm[pool->count].ptr = ptr;
-                pool->elm[pool->count].type = data_type;
+                pool->elm[pool->count].type = (uint16_t)data_type;
                 pool->elm[pool->count].uid = match_uid;
                 pool->elm[pool->count].refcount = 0;
                 pool->count++;
@@ -241,10 +243,10 @@ DBG_PRINT("GC thread started\n");
     while(atomic_load(&gc_stop) == 0) {
         int rc = 0;
         clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 1000000000 / SHM_GC_FREQ_CHECK;
-        if (ts.tv_nsec >= 1000000000) {
+        ts.tv_nsec += (long)(1000000000U / SHM_GC_FREQ_CHECK);
+        if (ts.tv_nsec >= 1000000000U) {
             ts.tv_sec += 1;
-            ts.tv_nsec -= 1000000000;
+            ts.tv_nsec -= 1000000000U;
         }
 
         rc = libsrpc_sem_timedwait(&gc->sem_wakeup, &ts);

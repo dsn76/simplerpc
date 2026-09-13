@@ -116,7 +116,7 @@ static inline int libsrpc_req_destroy(libsrpc_request_t *req)
 
 static inline int libsrpc_req_is_corrupted(libsrpc_request_t *req, libsrpc_req_ctrl_t *ctrl)
 {
-  unsigned int size = 0;
+  size_t size = 0;
 
   if(!req) {
     return(1);
@@ -145,6 +145,16 @@ static inline int libsrpc_req_is_corrupted(libsrpc_request_t *req, libsrpc_req_c
   return(0);
 }
 
+static inline libsrpc_response_t * libsrpc_req_get_response_fast(libsrpc_request_t *req, unsigned int idx)
+{
+  if(!req) {
+    return(NULL);
+  }
+  libsrpc_request_t req_tmp = *req;
+  unsigned int offset = req_tmp.retoff + req_tmp.retsz * idx;
+  return((libsrpc_response_t *)&req->buf[offset]);
+}
+
 static inline libsrpc_response_t * libsrpc_req_get_response(libsrpc_request_t *req, unsigned int idx)
 {
   if(!req) {
@@ -164,12 +174,12 @@ static inline int libsrpc_req_response_set(libsrpc_request_t *req, libsrpc_respo
   if(libsrpc_req_is_corrupted(req, ctrl)) {
     return(-EINVAL);
   }
-  if(!atomic_compare_exchange_strong_explicit(&resp->rc, &expected, LIBSRPC_RC_FLAG_LOCK, memory_order_acquire, memory_order_relaxed)) {
+  if(!atomic_compare_exchange_strong_explicit(&resp->rc, &expected, (srpc_rc_t)LIBSRPC_RC_FLAG_LOCK, memory_order_acquire, memory_order_relaxed)) {
     return(-EBUSY);
   }
   memcpy(&resp->buf[0], val, sz);
-  atomic_store_explicit(&resp->rc, LIBSRPC_RC_FLAG_READY, memory_order_release);
-  return(LIBSRPC_RC_FLAG_READY);
+  atomic_store_explicit(&resp->rc, (srpc_rc_t)LIBSRPC_RC_FLAG_READY, memory_order_release);
+  return((int)LIBSRPC_RC_FLAG_READY);
 }
 
 static inline int libsrpc_req_response_get(libsrpc_response_t *resp, void *val, size_t sz)

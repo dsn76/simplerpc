@@ -118,7 +118,7 @@ set(SRPC_SOURCES
 
 add_library(srpc SHARED ${SRPC_SOURCES})
 target_compile_definitions(srpc PRIVATE BUILD_TS="${BUILD_TS}")
-target_compile_options(srpc PRIVATE -Wall -Wextra -Werror -fPIC ${PROJECT_C_FLAGS})
+target_compile_options(srpc PRIVATE -Wall -Wextra -Werror -Wconversion -Wshadow -fPIC -mrdrnd ${PROJECT_C_FLAGS})
 target_include_directories(srpc PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${LIBS_DIR}

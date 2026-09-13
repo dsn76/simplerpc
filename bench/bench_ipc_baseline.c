@@ -64,7 +64,7 @@ int main(int ac, char **av)
     /* --- socketpair (AF_UNIX, SOCK_STREAM) --- */
     {
         int sv[2];
-        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) return 1;
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) { free(s); return 1; }
 
         pid_t pid = fork();
         if (pid == 0) {
@@ -80,7 +80,7 @@ int main(int ac, char **av)
     /* --- пара каналов pipe(2) --- */
     {
         int to_child[2], to_parent[2];
-        if (pipe(to_child) < 0 || pipe(to_parent) < 0) return 1;
+        if (pipe(to_child) < 0 || pipe(to_parent) < 0) { free(s); return 1; }
 
         pid_t pid = fork();
         if (pid == 0) {
@@ -96,5 +96,6 @@ int main(int ac, char **av)
         waitpid(pid, NULL, 0);
     }
 
+    free(s);
     return 0;
 }

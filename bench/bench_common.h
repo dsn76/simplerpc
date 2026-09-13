@@ -44,8 +44,8 @@ static inline void bench_report(const char *name, uint64_t *samples, size_t n,
     double p90 = (double)samples[(size_t)(n * 0.90)];
     double p99 = (double)samples[(size_t)(n * 0.99)];
 
-    printf("%-28s n=%-7zu min=%8.3f p50=%8.3f p90=%8.3f p99=%9.3f max=%10.3f "
-           "mean=%8.3f мкс",
+    printf("%-28s n=%-7zu min=%8.3f;  p50=%8.3f;  p90=%8.3f;  p99=%9.3f;  max=%10.3f;  "
+           "mean=%8.3f; мкс",
            name, n,
            samples[0] / 1000.0, p50 / 1000.0, p90 / 1000.0,
            p99 / 1000.0, samples[n - 1] / 1000.0, mean / 1000.0);

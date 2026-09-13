@@ -91,7 +91,7 @@ int libsrpc_proc_create(pid_t pid)
     memset(proc, 0, size);
     proc->pid = pid;
     proc->proc_uid = libsrpc_proc_get_uid();
-    proc->threads_num = threads_num;
+    proc->threads_num = (unsigned int)threads_num;
 
     rc = libsrpc_sem_init(&proc->sem_wakeup, 0);
     if(rc < 0) {

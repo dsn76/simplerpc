@@ -25,7 +25,7 @@ srpc_pool_fba_t * srpc_pool_create(size_t elm_num, size_t elm_size)
     pool->offset = fifo_size;
 
     for(size_t i = 0; i < elm_num; i++){
-        pool->fifo[pool->free++] = i;
+        pool->fifo[pool->free++] = (uint32_t)i;
     }
 
 end:
@@ -96,7 +96,7 @@ int srpc_pool_free(srpc_pool_fba_t *pool, void *ptr)
         pool = pool->nextpool;
     }
 
-    blk = ((uintptr_t)ptr - (uintptr_t)pool - pool->offset) / pool->blk_size;
+    blk = (uint32_t)(((uintptr_t)ptr - (uintptr_t)pool - pool->offset) / pool->blk_size);
     if(blk >= pool->blk_nums) return(-EBADF);
 
     oi = pool->free;

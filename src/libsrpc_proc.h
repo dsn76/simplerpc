@@ -23,7 +23,7 @@ enum e_libsrpc_proc_status {
 /* Структура потока процесса */
 typedef struct libsrpc_proc_thread_s {
     _Atomic(void *) hp_req; // Hazard Pointer для request.
-    //pthread_t thread; // Дескриптор потока.
+    pthread_t tid; // Дескриптор потока.
 } libsrpc_proc_thread_t;
 /* на эту структуру будет указывать локальный для потока указатель thread_req_current, для быстрого доступа к структуре запроса */
 
@@ -35,12 +35,12 @@ typedef struct libsrpc_proc_s {
     atomic_uint_least16_t status;   // Статус процесса.
     uint16_t        proc_uid;       // Идентификатор процесса внутри sRPC для маркировки блоков в TLSF.
     pid_t           pid;            // PID процесса.
-    atomic_int      threads_run;    // Количество запущенных потоков в процессе.
-    atomic_int      threads_wait;   // Количество ожидающих потоков в процессе.
+    _Atomic(unsigned int) threads_run;    // Количество запущенных потоков в процессе.
+    _Atomic(unsigned int) threads_wait;   // Количество ожидающих потоков в процессе.
     libsrpc_sem_t   sem_wakeup;     // Пробуждение потоков.
     libsrpc_list_head_t req_head;   // Список структур запросов в процессе, для обхода уборщиком мусора (RCU Hazard Pointer).
     lf_mpmc_queue_t queue;          // Очередь запросов в процессе.
-    int             threads_num;    // Ожидаемое количество потоков в процессе.
+    unsigned int    threads_num;    // Ожидаемое количество потоков в процессе.
     libsrpc_proc_thread_t threads[0]; // threads[threads_num] - Массив потоков процесса == число ядер процессора, вычисляется на этапе выделения памяти для процесса.
 } libsrpc_proc_t;
 

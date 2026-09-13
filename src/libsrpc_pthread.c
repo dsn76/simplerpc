@@ -238,7 +238,7 @@ out:
 int pthread_start_all_cpu(thread_func_t func, void *arg)
 {
     int rc = 0;
-    int cpu = 0;
+    unsigned int cpu = 0;
     cpu_set_t mask = {0};
     thread_flag_t flags = thread_flag_default();
 
@@ -266,7 +266,7 @@ int pthread_start_all_cpu(thread_func_t func, void *arg)
             
             rc = pthread_start(func, arg, flags);
             if (rc != 0) {
-                ERR_PRINT("pthread_start failed CPU=%d  rc=%d\n", cpu, rc);
+                ERR_PRINT("pthread_start failed CPU=%u  rc=%d\n", cpu, rc);
                 goto err;
             }
         }
