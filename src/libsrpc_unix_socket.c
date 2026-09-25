@@ -117,9 +117,11 @@ static int libsrpc_epoll_add(libsrpc_epoll_t *ed)
 
 static int libsrpc_unix_scoket_server_create(const char *name)
 {
+    int rc = -EBADF;
     struct sockaddr_un addr;
+
     int sck = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if(sck < 0) return -1;
+    if(sck < 0) return -errno;
 
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
@@ -132,16 +134,20 @@ static int libsrpc_unix_scoket_server_create(const char *name)
 /*    if (connect(sck, (struct sockaddr*)&addr, len) < 0) {
         goto err;
     } */
-    if (bind(sck, (struct sockaddr*)&addr, len) < 0)
+    if (bind(sck, (struct sockaddr*)&addr, len) < 0) {
+        rc = -errno;
         goto err;
+    }
 
-    if (listen(sck, 128) < 0)
+    if (listen(sck, 128) < 0) {
+        rc = -errno;
         goto err;
+    }
 
     return(sck);
 err:
     close(sck);
-    return -1;
+    return rc;
 }
 
 
@@ -339,22 +345,22 @@ int libsrpc_unix_server_init(libsrpc_server_t *srv, const char *name)
 
     srv->epfd = libsrpc_epoll_create();
     if(srv->epfd < 0) {
+        rc = -errno;
         ERR_PRINT("create epoll failed\n");
-        rc = -errno;
         goto err;
     }
 
-    srv->socket = libsrpc_unix_scoket_server_create(name);
-    if(srv->socket <= 0) {
-        rc = -errno;
-        if(errno != EADDRINUSE) ERR_PRINT("create socket failed (%d) %s\n", errno, strerror(errno));
+    rc = libsrpc_unix_scoket_server_create(name);
+    if(rc <= 0) {
+        if(rc != -EADDRINUSE) ERR_PRINT("create socket failed (%d) %s\n", rc, strerror(-rc));
         goto err;
     }
+    srv->socket = rc;
 
-    srv->epsrv.epfd = srv->epfd;
+    srv->epsrv.epfd   = srv->epfd;
     srv->epsrv.socket = srv->socket;
     srv->epsrv.events = EPOLLIN;
-    srv->epsrv.func = libsrpc_unix_server_worker;
+    srv->epsrv.func   = libsrpc_unix_server_worker;
 
     rc = libsrpc_epoll_add(&srv->epsrv);
     if(rc < 0) goto err;

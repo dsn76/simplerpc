@@ -11,5 +11,6 @@
     XF(RPC_SEND_ALL, pid_t,log_write,const char*) \
     XF(RPC_SEND_ALL, int,calc_add,int,int) \
     XF(RPC_SEND_ALL, void,all_exit) \
+    XF(RPC_SEND_ALL, void *,list_api,int,void *) \
 
 #endif // FILE_LIBSRPC_RPC_FUNCTIONS_H

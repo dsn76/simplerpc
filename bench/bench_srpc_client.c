@@ -76,7 +76,7 @@ int main(int ac, char **av)
         uint64_t t0 = bench_now_ns();
         int r = local_add_p(1, 2);
         uint64_t t1 = bench_now_ns();
-        if (r != 3) return 1;
+        if (r != 3) { free(s); return 1; }
         s[i] = t1 - t0;
     }
     bench_report("локальный вызов", s, iters, 0);
@@ -85,6 +85,7 @@ int main(int ac, char **av)
     for (size_t i = 0; i < iters; i++) {
         uint64_t t0 = bench_now_ns();
         void *p = malloc(64);
+        (void)p;
         free(p);
         uint64_t t1 = bench_now_ns();
         s[i] = t1 - t0;

@@ -45,6 +45,20 @@ static inline int libsrpc_sem_trywait(libsrpc_sem_t *sem)
     return sem_trywait(sem);
 }
 
+static inline int libsrpc_sem_time_calc(struct timespec *ts, uint64_t timeout_us)
+{
+    if(!ts || timeout_us == 0) return(-EINVAL);
+
+    clock_gettime(CLOCK_REALTIME, ts);
+    ts->tv_sec += (time_t)(timeout_us / 1000000U);
+    ts->tv_nsec += (long)((timeout_us % 1000000U) * 1000U);
+    if (ts->tv_nsec >= 1000000000L) {
+        ts->tv_sec++;
+        ts->tv_nsec -= 1000000000L;
+    }
+    return 0;
+}
+
 static inline int libsrpc_sem_timedwait(libsrpc_sem_t *sem, const struct timespec *abs_timeout)
 {
     return sem_timedwait(sem, abs_timeout);

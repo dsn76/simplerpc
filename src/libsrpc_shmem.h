@@ -52,5 +52,6 @@ void* libsrpc_shmem_realloc(void* ptr, size_t newsize);
 void  libsrpc_shmem_free(void *ptr);
 void  libsrpc_shmem_free_dc(void *ptr);
 int   libsrpc_shmem_link(void *ptr);
+int libsrpc_shmem_get_size(void *ptr, size_t *psz);
 
 #endif // FILE_LIBSRPC_SHMEM_H

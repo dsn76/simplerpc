@@ -26,7 +26,8 @@ extern "C" {
 typedef enum {
     LF_QUEUE_OK    = 0,
     LF_QUEUE_FULL  = -1,
-    LF_QUEUE_EMPTY = -2
+    LF_QUEUE_EMPTY = -2,
+    LF_QUEUE_NOT_FOUND = -3
 } lf_queue_result_t;
 
 // ========================= СТРУКТУРА ОЧЕРЕДИ =========================
@@ -52,6 +53,10 @@ void lf_mpmc_queue_init(lf_mpmc_queue_t* q);
 lf_queue_result_t lf_mpmc_queue_try_enqueue(lf_mpmc_queue_t* q, void* data);
 
 lf_queue_result_t lf_mpmc_queue_try_dequeue(lf_mpmc_queue_t* q, void** data);
+
+/* 0, если ptr ещё в опубликованной ячейке; LF_QUEUE_NOT_FOUND, если нет или слот уже забран.
+ * Снимок: параллельный dequeue во время просмотра даёт NOT_FOUND. ptr == NULL — сразу NOT_FOUND. */
+lf_queue_result_t lf_mpmc_queue_try_find_ptr(lf_mpmc_queue_t* q, void* ptr);
 
 #ifdef __cplusplus
 }

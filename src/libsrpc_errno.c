@@ -18,7 +18,7 @@ static errno2str_t errno2str[] = {
 };
 
 
-__thread int __libsrpc_errno;  /* локальная для потока переменная */
+static __thread int __libsrpc_errno;  /* локальная для потока переменная */
 
 int *
 __libsrpc_errno_location (void)

@@ -1000,6 +1000,36 @@ int tlsf_link(tlsf_t tlsf, void *ptr, uint16_t uid)
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ *  tlsf_check_uid
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+ int tlsf_check_uid(tlsf_t tlsf, void *ptr, uint16_t uid)
+ {
+     if (!tlsf || !ptr) return -TLSF_ERR_INVALID_PTR;
+     if (uid == 0) return -TLSF_ERR_UID_INVALID;
+ 
+     int rc = lock_and_recover(tlsf);
+     if (rc != TLSF_OK) return -rc;
+ 
+     block_header_t *block = block_from_ptr(ptr);
+     if (!validate_pointer(tlsf, block) || !validate_block_signature(block)) {
+         pthread_mutex_unlock(&tlsf->mutex);
+         return -TLSF_ERR_BLOCK_CORRUPTED;
+     }
+     if (block_is_free(block)) {
+         pthread_mutex_unlock(&tlsf->mutex);
+         return -TLSF_ERR_NOT_ALLOCATED;
+     }
+     if (uid_find(block, uid) >= 0) {
+         pthread_mutex_unlock(&tlsf->mutex);
+         return 1;
+     }
+     pthread_mutex_unlock(&tlsf->mutex);
+     return 0;
+ }
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
  *  tlsf_free_uid_blocks
  *  После деструктора куча могла сжаться (coalesce) — проход только с начала.
  * ═══════════════════════════════════════════════════════════════════════════ */

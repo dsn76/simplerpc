@@ -102,6 +102,91 @@ int libsrpc_shm_gc_wakeup(void)
 }
 
 /* -------------------------------------------------------------------------- */
+
+libsrpc_shm_trash_t * libsrpc_shm_trash_create_node(uint32_t num)
+{
+    libsrpc_shm_trash_t *trash = (libsrpc_shm_trash_t *)malloc(sizeof(libsrpc_shm_trash_t) + num * sizeof(void *));
+    if(trash == NULL) {
+        return NULL;
+    }
+    trash->num = num;
+    trash->cnt = 0;
+    trash->uid = 0;
+    libsrpc_list_node_init(&trash->node);
+DBG_PRINT("GC: trash=%p, uid=%d, cnt=%u\n", (void*)trash, trash->uid, trash->cnt);
+    return trash;
+}
+
+static void libsrpc_shm_trash_destroy_node(libsrpc_shm_trash_t *trash)
+{
+    libsrpc_shmem_t *shm = libsrpc_shmem_get();
+
+    if(trash == NULL || shm == NULL) {
+        return;
+    }
+
+    /* быстро удалим под блокировкой */
+    tlsf_lock((tlsf_t)shm->poolptr);
+    for(uint32_t i = 0; i < trash->cnt; i++) {
+        tlsf_free_nb((tlsf_t)shm->poolptr, trash->ptr[i], trash->uid);
+    }
+    tlsf_unlock((tlsf_t)shm->poolptr);
+DBG_PRINT("GC: trash=%p, uid=%d, cnt=%u\n", (void*)trash, trash->uid, trash->cnt);
+    libsrpc_list_remove(&trash->node);
+    free(trash);
+}
+
+int libsrpc_shm_trash_add_node(libsrpc_shm_trash_t *trash)
+{
+    libsrpc_shmem_t *shm = libsrpc_shmem_get();
+
+    if(trash == NULL || shm == NULL) {
+        return -EINVAL;
+    }
+
+    int rc = libsrpc_list_push_front(&shm->gc.list_head, &trash->node);
+    if(rc < 0) {
+        return -ENOMEM;
+    }
+
+    return 0;
+}
+
+int libsrpc_shm_trash_add_ptr(libsrpc_shm_trash_t **ptr_trash, void *ptr)
+{
+    if(ptr_trash == NULL || *ptr_trash == NULL || ptr == NULL) {
+        return -EINVAL;
+    }
+    if((*ptr_trash)->cnt >= (*ptr_trash)->num) {
+        uint32_t new_num = (*ptr_trash)->num + ((*ptr_trash)->num / 4);
+        void * new_ptr = realloc(*ptr_trash, sizeof(libsrpc_shm_trash_t) + new_num * sizeof(void *));
+        if(new_ptr == NULL) {
+            return -ENOMEM;
+        }
+        *ptr_trash = (libsrpc_shm_trash_t *)new_ptr;
+        (*ptr_trash)->num = new_num;
+    }
+    (*ptr_trash)->ptr[(*ptr_trash)->cnt++] = ptr; // Добавляем блок памяти в массив.
+    return 0;
+}
+
+static int libsrpc_shm_trash_clear_list(void)
+{
+    libsrpc_shmem_t *shm = libsrpc_shmem_get();
+    if(shm == NULL) {
+        return -EINVAL;
+    }
+
+    libsrpc_shm_trash_t *trash = NULL;
+    LIBSRPC_LIST_FOREACH_SAFE(&shm->gc.list_head, trash, libsrpc_shm_trash_t, node) {
+        if(libsrpc_shmem_is_locked_uid(trash->uid)) continue;
+        libsrpc_shm_trash_destroy_node(trash);
+    }
+
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
 /* GC поток */
 /* -------------------------------------------------------------------------- */
 
@@ -179,21 +264,38 @@ static int gc_pool_destroy(libsrpc_shmem_t *shm, gc_pool_t *pool)
 
     for(int i = 0; i < pool->count; i++) {
         switch(pool->elm[i].type) {
-            case LIBSRPC_SHMDT_PROC:
+            case LIBSRPC_SHMDT_PROC: {
+                libsrpc_proc_t *proc = pool->elm[i].ptr;
+                if(libsrpc_proc_cs_aimed_at(proc)) {
+                    pool->elm[i].refcount++;
+                } else if(atomic_load_explicit(&proc->status, memory_order_acquire)
+                          == LIBSRPC_PROC_STATUS_DELETE) {
+                    libsrpc_sem_destroy(&proc->sem_wakeup);
+                    atomic_store_explicit(&proc->status, LIBSRPC_PROC_STATUS_DEAD,
+                                          memory_order_release);
+                }
                 break;
+            }
             case LIBSRPC_SHMDT_REGFN:
+                if(libsrpc_shmem_is_busy_regfn(pool->elm[i].ptr)) {
+                    pool->elm[i].refcount++;
+                    //DBG_PRINT("GC: regfn is busy, refcount=%u\n", pool->elm[i].refcount);
+                }
                 break;
             case LIBSRPC_SHMDT_REQUEST:
                 if(libsrpc_req_is_busy_proc(pool->elm[i].ptr)) {
                     pool->elm[i].refcount++;
                     //DBG_PRINT("GC: request is busy, refcount=%u\n", pool->elm[i].refcount);
+                } else {
+                    /* Слот не в очереди и не в HP: гасим sign и семафор до free. */
+                    libsrpc_req_destroy(pool->elm[i].ptr);
                 }
                 break;
         }
     }
 
     for(int i = 0; i < pool->count; i++) {
-        if(pool->elm[i].ptr != NULL || pool->elm[i].refcount == 0) {
+        if(pool->elm[i].ptr != NULL && pool->elm[i].refcount == 0) {
             free_count++;
             switch(pool->elm[i].type) {
                 case LIBSRPC_SHMDT_PROC:
@@ -201,8 +303,6 @@ static int gc_pool_destroy(libsrpc_shmem_t *shm, gc_pool_t *pool)
                 case LIBSRPC_SHMDT_REGFN:
                     break;
                 case LIBSRPC_SHMDT_REQUEST:
-                    libsrpc_req_destroy(pool->elm[i].ptr);
-                    //DBG_PRINT("GC: request destroyed, refcount=%u\n", pool->elm[i].refcount);
                     break;
                 default:
                     break;
@@ -218,7 +318,7 @@ static int gc_pool_destroy(libsrpc_shmem_t *shm, gc_pool_t *pool)
     /* быстро удалим под блокировкой */
     tlsf_lock((tlsf_t)shm->poolptr);
     for(int i = 0; i < pool->count; i++) {
-        if(pool->elm[i].refcount == 0) {
+        if(pool->elm[i].ptr != NULL && pool->elm[i].refcount == 0) {
             tlsf_free_nb((tlsf_t)shm->poolptr, pool->elm[i].ptr, pool->elm[i].uid);
             //DBG_PRINT("GC: block freed, ptr=%p, type=%d, uid=%d, refcount=%u\n", pool->elm[i].ptr, pool->elm[i].type, pool->elm[i].uid, pool->elm[i].refcount);
         }
@@ -231,6 +331,7 @@ static int gc_pool_destroy(libsrpc_shmem_t *shm, gc_pool_t *pool)
 
 static void * libsrpc_shm_gc_thread(void *arg)
 {
+    int rc = 0;
     libsrpc_shm_gc_t *gc = (libsrpc_shm_gc_t *)arg;
     libsrpc_shmem_t *shm = libsrpc_shmem_get();
     struct timespec ts = {0};
@@ -239,9 +340,13 @@ DBG_PRINT("GC thread started\n");
         ERR_PRINT("shm is NULL\n");
         return NULL;
     }
+    rc = libsrpc_list_head_init(&gc->list_head);
+    if(rc < 0) {
+        ERR_PRINT("libsrpc_list_init failed\n");
+        return NULL;
+    }
 
     while(atomic_load(&gc_stop) == 0) {
-        int rc = 0;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_nsec += (long)(1000000000U / SHM_GC_FREQ_CHECK);
         if (ts.tv_nsec >= 1000000000U) {
@@ -260,12 +365,13 @@ DBG_PRINT("GC thread started\n");
             break;
         }
 
+        libsrpc_shm_trash_clear_list();
+
         memset(&gc_pool, 0, sizeof(gc_pool));
         tlsf_free_uid_blocks((tlsf_t)shm->poolptr, 0, destructor_fn, &gc_pool);
         if(gc_pool.count == 0) continue;
 
         gc_pool_destroy(shm, &gc_pool);
-
     }
 DBG_PRINT("GC thread stopped\n");
     return NULL;

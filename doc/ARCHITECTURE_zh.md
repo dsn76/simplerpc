@@ -1,115 +1,131 @@
 # simplerpc 架构
 
-本文档描述 `libsrpc` 库的内部结构、组成部件以及各部件之间的交互机制。
+本文档描述 `libsrpc` 的内部结构：库由哪些部分组成，一次调用如何进行，进程死亡时发生什么，以及当前实现的薄弱之处。面向使用者的一面——构建、API、示例——见 [README](../README_zh.md)。
 
 ## 🏗 总体理念
 
-**simplerpc** 是一个基于共享内存（Shared Memory）的透明 RPC 框架。与经典的 RPC 系统（将参数序列化为字节流——Protobuf、JSON——再经网络传输）不同，`simplerpc` 直接在所有进程以同一虚拟地址映射的公共内存段中传递调用参数，从而避免了跨地址空间的拷贝。
+**simplerpc** 是建立在共享内存之上的 RPC。传统 RPC 系统把调用序列化成字节流（Protobuf、JSON）再经套接字送出。`simplerpc` 把参数放进公共内存池，所有进程把这个池映射到同一个虚拟地址。在一个进程中取得的指针在另一个进程中同样有效，套接字只用于事务性消息。
 
 ### 核心原则
-1. **零配置守护进程（Zero-Conf Daemon）：** 后台协调进程在库被任何应用加载时自动启动，并在最后一个客户端断开后退出。
-2. **内存为中心（Memory-Centric）：** 所有数据、进程描述符、函数注册表和消息队列都存放在由事务型 TLSF 分配器管理的共享内存中。
-3. **链接期分派（Link-Time Dispatch）：** 进程的角色（调用方或执行方）由链接器通过 `weak alias` 决定，而非配置或运行时注册。没有 IDL，也没有代码生成器——一切由单个 X-macro 经预处理器展开。
-4. **基于所有权的清理（Ownership-Based Cleanup）：** 每个内存块都带有属主进程的 UID 标记，因此对崩溃或断开的进程，其名下的一切都可以被完整回收，无需维护外部分配登记簿。
-5. **透明 IPC（可选）：** 替换标准函数（`malloc`、`free`）可使现有代码无需修改即可操作共享内存。默认通过构建选项 `DISABLE_ALLOC=ON` 关闭。
 
-## 🧩 主要组件
+1. **零配置守护进程（Zero-Conf Daemon）。** 第一个进程加载库时，后台协调进程自行启动，并在最后一个客户端断开后退出。没有配置，没有 PID 文件，也没有服务。
+2. **内存为中心（Memory-Centric）。** 进程描述符、函数注册表、队列、请求和应答都位于事务型 TLSF 分配器管理的共享池中。调用数据不经过套接字。
+3. **链接期分派（Link-Time Dispatch）。** 链接器通过 `weak alias` 为每个函数决定进程的角色：定义了函数就是执行方，没有定义就是调用方。没有 IDL，也没有代码生成器，一切由单个 X-macro 经预处理器展开。
+4. **基于所有权的清理（Ownership-Based Cleanup）。** 内存池中的每个块都带有属主进程的 UID。按这个 UID 为死亡进程善后，无需单独的分配登记簿。存活的请求可以保持某个进程的 UID，从而推迟其用户块的清理。
+5. **透明 IPC（可选）。** 替换 `malloc`/`free` 可使现有代码无需修改即可使用内存池。默认关闭（`DISABLE_ALLOC=ON`）。
 
-### 1. Guard Daemon（后台守护进程）
-协调进程，负责管理内存池、函数注册表和进程描述符的生命周期。RPC 流量不经过守护进程——它只是资源的所有者和注册的"公证人"。
+## 🧩 组件
 
-* **启动：** 由 `spawn_daemon()` 函数实现。守护进程通过双重 `fork()` 和 `setsid()` 创建，成为无控制终端的孤儿进程，且不会在调用方留下僵尸进程。
-* **嵌入式加载器（Embedded Loader）：** 守护进程的可执行文件不落盘。它以 C 数组形式（由 `src/libsrpc_loader.c` 经 `xxd -i -n loader` 生成）内嵌在 `libsrpc.so` 库本身中，写入 RAM 中的临时 `memfd`，再通过 `fexecve()` 启动。加载器通过环境变量 `LIBSIMPLERPC_SO` 获得库的路径（其值经 `dladdr()` 取得），执行 `dlopen()` 后将控制权交给 `simplerpc_daemon_main()`。
-* **为什么用独立进程而不是线程：** 守护进程需要干净的地址空间——它以 `MAP_FIXED_NOREPLACE` 将内存池映射到固定地址 `SHMEM_BASE_VADR`，且不应承载父应用的分配和线程。
-* **领导者选举：** *每个*进程都会尝试拉起守护进程，但抽象 Unix socket 的 `bind()` 是原子的：失败者收到 `EADDRINUSE` 并静默退出。客户端在 `ECONNREFUSED` 时重试 `connect()`（约 1 秒内）。
-* **职责：** 创建抽象 Unix socket，分配共享内存，向连接的客户端分发内存文件描述符（FD），维护 RPC 函数注册表，并启动垃圾回收线程。
-* **退出：** 主循环为 `epoll_wait(timeout = 1 s)`；当客户端计数降为零时，守护进程退出，共享内存（匿名 `memfd`）随最后一个引用一并消失。
+### 1. 协调守护进程（Guard Daemon）
 
-### 2. 传输层（Unix Sockets & SCM_RIGHTS）
-仅用于信令交互、函数注册和建立连接。
+守护进程拥有内存池、函数注册表和进程描述符。RPC 流量不经过它：守护进程只分发内存、注册执行方，并为死亡者善后。
 
-* **抽象 socket：** socket 名称形如 `"simplerpc_" BUILD_TS`，其中 `BUILD_TS` 是构建时间戳。链接不同构建版本库的应用会落入互不交叉的"域"。
-* **连接顺序（`libsrpc_unix_server_addclient`）：** `accept4()` → `SO_PEERCRED`（获取客户端 PID）→ `libsrpc_proc_create(pid)` → `SO_RCVTIMEO = 5 s` → 读取注册消息 → 注册函数 → 传递内存 FD → 加入 `epoll`。
-* **客户端-服务器：** 只有在注册成功之后，守护进程才通过 `SCM_RIGHTS` 机制（ancillary data）向客户端传递共享内存的文件描述符（FD）。未通过签名校验的客户端永远无法访问内存池。
-* **mmap：** 客户端拿到 FD 后，以事先约定的虚拟地址（`SHMEM_BASE_VADR`）和 `MAP_FIXED_NOREPLACE` 标志对守护进程所映射的同一内存区域执行 `mmap()`。这保证了一个进程中创建的指针在另一个进程中依然有效。此外还会校验池头部的签名。
-* **死亡检测：** 连接断开（`EPOLLHUP | EPOLLRDHUP` 或 `recv() == 0`）是客户端已消失的唯一且充分的标志。内核会关闭 socket，因此无论是 `exit()`、`SIGKILL` 还是 segfault，事件都会送达。
-* **客户端控制线程：** 应用侧由一个独立的 detached 线程 `unix_client` 负责处理该连接，它完成全部初始化（注册、`mmap`、启动执行方），然后挂起在 `epoll_wait` 中。退出唤醒通过 `eventfd` 实现。
+* **启动。** `spawn_daemon()` 做两次 `fork()`，中间夹一次 `setsid()`。第一个子进程立即退出，父进程用 `waitpid()` 回收它。第二个子进程成为没有控制终端的孤儿，也不留下僵尸。
+* **内嵌加载器。** 守护进程的可执行文件不在磁盘上。构建时 `src/libsrpc_loader.c` 由 `gcc` 编译成一个没有符号的小型动态链接 ELF。`xxd -i -n loader` 把它变成 C 数组，数组再编译进 `libsrpc.so`。启动时数组写入 `memfd`，经 `fexecve()` 执行。`argv[0]` 传入守护进程名 `"simplerpc_" BUILD_TS`。环境只有一个变量 `LIBSIMPLERPC_SO`，其值是经 `dladdr()` 取得的库路径。加载器 `dlopen()` 这个库，并把控制权交给 `simplerpc_daemon_main()`。
+* **为什么是进程而不是线程。** 守护进程需要干净的地址空间：它把内存池映射到固定地址 `SHMEM_BASE_VADR`，不能背上拉起它的那个应用的分配、线程和描述符。它的寿命也不应取决于那个应用的寿命。
+* **选出领导者。** 每个进程都尝试拉起守护进程，但抽象套接字的 `bind()` 是原子的。失败者得到 `EADDRINUSE` 并静默退出。客户端在 `ECONNREFUSED` 时重试 `connect()`，最多 10 000 次，每次暂停 100 微秒，合计约一秒。
+* **职责。** 监听抽象套接字，创建内存池并分发其描述符，维护函数注册表，启动垃圾回收线程，为断开的客户端善后。
+* **退出。** 主循环是超时 1 秒的 `epoll_wait()`。客户端计数降到零时守护进程退出，内存池的匿名 `memfd` 随最后一次引用消失。
+* **输出。** 守护进程继承拉起它的那个进程的 `stdout` 和 `stderr`，因此它的消息出现在那个进程的终端里。
 
-### 3. 内存管理（TLSF 共享内存）
+### 2. 传输（UNIX 套接字与 SCM_RIGHTS）
 
-* **tlsf_txn v4.1：** 事务型 TLSF 分配器，源码直接包含在项目树中（`libs/tlsf_txn/`，无 git 子模块）。依靠 `FL × SL` 空闲链表矩阵和位图实现确定性的 O(1) 块分配。内存池格式带版本号（`TLSF_FORMAT_VERSION`），外来格式会被拒绝。
-* **分配器内部的健壮互斥锁（Robust Mutex）：** 进程间互斥由 `pthread_mutex_t` 提供，属性为 `PTHREAD_PROCESS_SHARED | PTHREAD_MUTEX_ROBUST | PTHREAD_MUTEX_RECURSIVE`，*内嵌*于内存池控制结构中。`libsrpc` 自身不直接加锁——它只调用 `tlsf_*`（与 0.1.x 版本不同，那时互斥锁位于 libsrpc 结构中，每次操作都需手动加锁）。
-* **BUL（Binary Undo Log）：** 每次写入 8 字节元数据字之前，旧值都会保存到池内的回滚栈。操作成功即提交（重置栈顶）。若互斥锁属主死亡，下一次 `tlsf_lock()` 会收到 `EOWNERDEAD`，自动回滚未完成的事务（`bul_recover`），并调用 `pthread_mutex_consistent()`。无需外部看门狗，内存池始终保持一致。
-* **所有权模型（UID）：** 每个块头含 `uid[12]` 数组。只有当所有属主都解除关联后，块才会归还内存池。`libsrpc` 向分配器传递 `proc_uid`——由守护进程签发的 16 位进程标识（守护进程自身为 `DAEMON_PROC_UID = 1`）。`libsrpc_shmem_link()` 允许进程将自己加为其他进程的块的属主，从而保护它不被释放。
-* **块的类型化：** 块头中有一个 15 位的 `data_type` 字段，存储 `libsrpc_shm_data_type_t` 中的一种类型：`USER`（应用数据）、`PROC`（进程描述符）、`REGFN`（函数注册表块）、`REQUEST`（RPC 请求块）。垃圾回收器和析构函数依据该字段区分用户内存与服务内存。
-* **延迟清理标志（`dc`）：** 同一头部字段中的 1 个比特。它充当 retire 标记："块在逻辑上已死，但当前不能释放"。由 `libsrpc_shmem_free_dc()`（= `tlsf_setdc()`）置位，由垃圾回收器读取。
-* **分配器劫持（Allocator Hijacking，可选）：** 库可以拦截标准函数 `malloc`、`calloc`、`realloc` 和 `free`，并通过 `dlsym(RTLD_NEXT)` 取得原始函数。借助 `Thread Local Storage`（TLS），线程可以在系统分配器与共享内存分配器之间"热切换"（`libsrpc_alloc_sw_std()` / `libsrpc_alloc_sw_shm()`）。默认通过 `DISABLE_ALLOC=ON` 将整段代码从构建中剔除。
+套接字只用于连接、注册函数、传递内存池描述符，以及发现客户端死亡。
+
+* **抽象套接字。** 名字是 `"simplerpc_" BUILD_TS`，其中 `BUILD_TS` 是构建配置的时间戳。加载了不同 `libsrpc.so` 构建的进程落入互不相交的域。抽象套接字没有文件系统权限。
+* **连接顺序**（`libsrpc_unix_server_addclient`）：`accept4()` → `SO_PEERCRED`（凭证中只取 PID）→ `libsrpc_proc_create(pid)` → `SO_RCVTIMEO = 5 秒` → 读取注册消息 → 注册函数 → 传递内存池 FD → 加入 `epoll`。签名不对的客户端进不了内存池。不检查客户端的 UID。
+* **映射内存池。** 收到 FD 后，客户端以 `MAP_FIXED_NOREPLACE` 在 `SHMEM_BASE_VADR` 上 `mmap()`，并核对内存池头部的签名。地址已被占用时，`mmap()` 失败，而不是覆盖别人的映射。
+* **死亡检测。** 连接断开（`EPOLLHUP | EPOLLRDHUP` 或 `recv() == 0`）是客户端已不存在的唯一且充分的标志。套接字由内核关闭，因此 `exit()`、`SIGKILL` 和段错误都会同样带来这个事件。为此不需要心跳，也不需要超时。
+* **客户端控制线程。** 应用中由一个 detached 的 `unix_client` 线程维护连接。它连接、发送注册、接收 FD、映射内存池、找到自己的进程描述符、启动执行方线程、把状态置为 `RUN` 并允许 RPC（`rpc_enable`）。库的构造函数在信号量上等待，直到该线程完成初始化或报告错误，因此进入 `main()` 时进程已经就绪。随后线程在 `epoll_wait()` 中休眠。退出时通过 `eventfd` 唤醒它。
+
+### 3. 内存管理（共享内存中的 TLSF）
+
+* **tlsf_txn v4.1。** 事务型 TLSF 分配器，源码在项目树中（`libs/tlsf_txn/`）。依靠 `FL × SL` 空闲链表矩阵和位图，分配为 O(1)。内存池格式带版本号（`TLSF_FORMAT_VERSION = 0x00040000`），外来格式会被拒绝。
+* **池内的健壮互斥锁。** 跨进程互斥由 `pthread_mutex_t` 提供，属性为 `PTHREAD_PROCESS_SHARED | PTHREAD_MUTEX_ROBUST | PTHREAD_MUTEX_RECURSIVE`，放在内存池的控制结构里。`libsrpc` 自己不拿这把锁，只调用 `tlsf_*`。例外是垃圾回收器：它在一次显式的 `tlsf_lock()` 之下成批释放块。
+* **BUL（Binary Undo Log）。** 每写一个 8 字节的元数据字之前，旧值被压入池内的回滚栈，操作成功则重置栈（提交）。若互斥锁属主死亡，下一次加锁收到 `EOWNERDEAD`，回滚未完成的操作并调用 `pthread_mutex_consistent()`。无需外部看门狗，内存池保持一致。回滚的只是分配器的元数据：日志不保护块内的数据。
+* **属主（UID）。** 块头有数组 `uid[12]`。只有当所有属主都从数组中划掉之后，块才归还内存池。`libsrpc` 向分配器传递 `proc_uid`——守护进程发给每个客户端的 16 位标识（守护进程自身为 `DAEMON_PROC_UID = 1`）。进程断开后标识会被复用。
+  * `libsrpc_shmem_link()` 增加属主。
+  * `libsrpc_shmem_free()` 只划掉调用者的 UID。
+  * `libsrpc_shmem_realloc()` 只对唯一属主的块有效。
+  * `libsrpc_shmem_get_size()` 读取有效载荷大小。
+* **块的类型。** 头部中 15 位的 `data_type` 字段存放 `libsrpc_shm_data_type_t`：`USER`（应用数据）、`PROC`（进程描述符）、`REGFN`（函数注册表块）、`REQUEST`（请求块）。析构函数和垃圾回收器据此区分用户内存与服务内存。
+* **延迟清理标志（`dc`）。** 同一个字中的 1 个比特。含义是“块在逻辑上已死，但现在还不能释放”。由 `libsrpc_shmem_free_dc()`（= `tlsf_setdc()`）置位，由垃圾回收器读取。
+* **错误码。** 内存函数把分配器码 `TLSF_ERR_*`（1…15）写入线程的错误码（`libsrpc_errno_get()`）。这些编号与系统 `errno` 重叠，因此由 `tlsf_strerror()` 解读，而不是 `libsrpc_strerror()`。
+* **分配器替换（可选）。** 库可以拦截 `malloc`、`calloc`、`realloc` 和 `free`，通过 `dlsym(RTLD_NEXT)` 取得原始函数。TLS 中的标志在系统堆和内存池之间切换线程（`libsrpc_alloc_sw_std()` / `libsrpc_alloc_sw_shm()`）。默认不构建拦截代码（`DISABLE_ALLOC=ON`）。
 
 ### 4. 垃圾回收器（共享内存 GC）
-一个**只存活于守护进程内**的独立线程（由 `libsrpc_shmem_create()` 初始化），负责回收那些因其他进程中可能存在读者而不能立即释放的服务结构。
 
-* **共享内存中的闹钟：** GC 结构（线程 + 信号量）位于 `libsrpc_shmem_t` 中，因此任意进程都可通过 `sem_post` 调用 `libsrpc_shm_gc_wakeup()` 唤醒回收器。此外 GC 还按超时自动醒来，频率为每秒 `SHM_GC_FREQ_CHECK` 次（默认 10）。
-* **垃圾查找：** `tlsf_free_uid_blocks(pool, 0, ...)` —— 对堆做物理遍历，寻找带 `dc == 1` 标志的已分配块。没有单独的延迟对象列表：块头标志就承担了这一角色。
-* **占用检查（Hazard Pointers）：** 找到的块被收集进本地累积池，随后对每个请求调用 `libsrpc_req_is_busy_proc()`，它会遍历所有存活的 `libsrpc_proc_t` 及其全部 `threads[i].hp_req`。只要有任何一个执行方线程发布了指向该请求的指针，该块就保留到下一轮。
-* **批量释放：** 空闲块在单次 `tlsf_lock()` / `tlsf_free_nb()` × N / `tlsf_unlock()` 之下成批删除——避免为每个块都抓取跨进程互斥锁。
-* **崩溃进程善后：** 连接断开时守护进程调用 `libsrpc_proc_destroy()`，它将进程从函数注册表中移除、使其描述符失效、取消挂起的请求（`-ECANCELLED`），并调用 `tlsf_free_uid_blocks(pool, proc_uid, ...)`——按属主 UID 直接遍历堆。用户块立即释放，服务块标记 `dc` 交由 GC 处理。
+一个**只存活于守护进程内**的独立线程（由 `libsrpc_shmem_create()` 启动）。它释放那些因其他进程的线程可能仍在读取而不能立即释放的服务块，以及因保持而被推迟清理的用户块。
 
-### 5. RPC 机制与宏（X-Macro）
-为消除样板代码，使用了 C 预处理器（`src/macro.h`、`src/argfunc.h`）。
+* **池中的闹钟。** GC 结构——线程、信号量和延迟块列表 `list_head`——位于 `libsrpc_shmem_t` 中，因此任意进程都可通过 `sem_post` 调用 `libsrpc_shm_gc_wakeup()` 唤醒回收器。此外 GC 自己每秒醒来 `SHM_GC_FREQ_CHECK` 次（默认 10）。
+* **服务块。** `tlsf_free_uid_blocks(pool, 0, ...)` 遍历堆，把 `dc == 1` 的已分配块收进本地累积器（每轮最多 1024 个）。服务块没有单独的列表：块头标志承担这一角色。
+* **占用检查（Hazard Pointer）。** 对每个找到的请求，`libsrpc_req_is_busy_proc()` 检查所有存活进程的 `threads[i].hp_req`。只要有任何一个执行方线程发布了指向该请求的指针，块就保留到下一轮。
+* **被推迟的用户块。** 若进程在其 UID 被保持期间死亡，指向其用户块的指针连同 UID 一起进入 `gc.list_head` 的节点。节点用普通 `malloc` 分配在守护进程的地址空间中，不属于内存池。每一轮 GC 都检查是否还有人保持这个 UID。如果没有，节点中的块被释放。
+* **批量释放。** 可以释放的块一次成批删除：`tlsf_lock()`、`tlsf_free_nb()` × N、`tlsf_unlock()`。跨进程互斥锁每轮只取一次，而不是每个块一次。
 
-* **RPC_LIST：** 位于 `src/libsrpc_rpc_functions.h` 的 X-macro，唯一的事实来源。条目格式：`XF(分派策略, 返回类型, 名称, 参数类型...)`。原型、标识符、包装器、函数表以及调度器的 `switch` 都由它展开。
-* **标识符：** 每个函数获得唯一 ID `sRPCFNID_<name>`（编号从 `sRPCFNID_START = 16` 起）以及注册表索引 `sRPC_ID2IDX(id)`。
-* **包装器生成：** 编译期生成桩函数（`sRPCFN(name)` → `librpcimp_<name>`），它们将参数序列化进请求缓冲区（`libsrpc_request_t`），并将其放入执行方的 MPMC 队列。
-* **分派：** 执行方一侧，宏 `M_DECL`、`M_EXTRACT`、`M_ARGNAMES` 自动把缓冲区反序列化回栈变量并调用原始函数，然后将结果拷入应答槽。
-* **按返回类型的编译期分支：** 由于 C 不允许在预处理器中比较类型，使用了仅对 `void` 定义的宏 `COMPARE_void` 的技巧：`IIF(EQUAL(rettype, void))` 针对 `void` 与非 `void` 函数展开出不同的代码（`RETDATA`）。
-* **设计限制：** 不允许可变参数函数；参数按字节拷贝（`memcpy`），因此只允许标量类型和指针，且指针只有在指向共享池时才有意义。
+### 5. RPC 机制与 X-macro
 
-### 6. RPC 函数的动态链接
-"谁能执行什么"的注册分四个阶段完成，既不需要 `dlsym`，也不需要运行时生成桩代码。
+样板代码由预处理器生成（`src/macro.h`、`src/argfunc.h`）。
 
-1. **Weak alias（链接阶段）。** 对 `RPC_LIST` 中的每个函数，库声明 `__attribute__((weak, alias("librpcimp_" #name))) rettype name(...);`。若应用自行定义了该函数——强符号覆盖 alias，进程即成为**执行方**。若没有——符号解析到桩函数，进程即成为**调用方**。该决定对每个函数独立作出：同一进程可以是某些函数的执行方，同时又是另一些函数的调用方。
-2. **位图（进程启动）。** 表 `srpc_fn[]` 为每个函数存一对地址：`.rpc`（桩函数地址）和 `.loc`（符号实际解析到的地址）。`libsrpc_bmp_func_set()` 函数比较二者并在 `srpc_bmp_func_t` 中置位——"我会执行这个"。只是两个指针的比较，没有字符串，也没有运行时解析。
-3. **传给守护进程（连接时）。** `connect` 之后、收到内存 FD 之前，位图通过 Unix socket 以 `regfn_msg_t { size, sign[32], bmp }` 消息发送给守护进程。守护进程校验大小和签名（`"simplerpc_" BUILD_TS`）——防止不同版本 `RPC_LIST` 的应用相互对接。
-4. **注册表录入（守护进程）。** `libsrpc_reg_func_form_bmp()` 把客户端的 `libsrpc_proc_t` 指针插入位于共享内存中的 `srpc_regfn_shm_t` 注册表。客户端自身从不写注册表。
+* **RPC_LIST。** `src/libsrpc_rpc_functions.h` 中的 X-macro 是唯一的事实来源。条目：`XF(分派策略, 返回类型, 名字, 参数类型...)`。由它展开原型、标识、包装器、函数表和调度器的 `switch`。
+* **标识。** 库内部函数得到 `sRPCFNID_<name>`（编号从 `sRPCFNID_START = 16` 之后开始）和注册表索引 `sRPC_ID2IDX(id)`。在公开的 `libsrpc.h` 中，同一个编号表现为 `libsrpc_funid_<name>`。
+* **包装器。** 每个函数生成桩 `librpcimp_<name>`（`sRPCFN(name)`）。它把参数序列化进请求块 `libsrpc_request_t`，分发到各执行方的队列，等待应答，并返回第一个槽的结果。
+* **调度。** 在执行方，宏 `M_DECL`、`M_EXTRACT`、`M_ARGNAMES` 把缓冲区拆回栈变量，调用真正的函数，并把结果写入应答槽。`void` 函数的槽只收到就绪标志，没有数据。
+* **按返回类型分支。** C 预处理器不能比较类型，因此使用只为 `void` 定义的宏 `COMPARE_void`。`IIF(EQUAL(rettype, void))` 为 `void` 函数和非 `void` 函数展开成不同的代码（`RETDATA`）。
+* **构造上的限制。** 不允许变参函数。参数按字节拷贝（`memcpy`），因此传递标量类型和指针，而指针只有指向公共池时才有意义。
 
-**注册表结构**（`srpc_regfn_shm_t`，每个函数一条记录）：
+### 6. 函数注册
 
-* `main_block` —— 结构体内部直接内置 8 个 `_Atomic(libsrpc_proc_t *)` 槽位，无需任何分配。典型场景（每个函数只有少数执行方）零内存分配即可满足。
-* `ext_block` —— 主块溢出时分配 `+32` 槽位的扩展块，拷贝旧内容，并通过 `atomic_compare_exchange_strong` 发布新块。竞争失败者释放自己的块并重试。
-* 旧的 `ext_block` 不立即释放：其签名被清零，块标记 `dc`（`libsrpc_shmem_free_dc`）并唤醒 GC——一种 RCU 式的延迟回收方案。
-* `num_all` —— 该函数已注册执行方的原子计数器。客户端准备请求时读取它，以决定预留多少个应答槽。若 `num_all == 0`，调用立即以 `-ENOREGFUN` 失败。
-* 槽位的插入和删除全部用 CAS 操作完成，不使用任何互斥锁。
+“谁能执行什么”的注册分四步，既不需要 `dlsym`，也不需要在运行时生成桩。
 
-**注销**发生在 socket 关闭时：`libsrpc_proc_destroy()` → `libsrpc_unreg_func_proc()` 将进程从所有 `main_block`/`ext_block` 中移除，并递减 `num_all`。
+1. **Weak alias（链接）。** 对 `RPC_LIST` 中的每个函数，库声明 `__attribute__((weak, alias("librpcimp_" #name))) rettype name(...);`。应用定义了函数时，强符号覆盖 alias，进程成为**执行方**。否则符号解析到桩，进程成为**调用方**。决定按函数分别作出。
+2. **位图（进程启动）。** 表 `srpc_fn[]` 为每个函数保存一对地址：`.rpc`（桩）和 `.loc`（符号实际解析到的地方）。`libsrpc_bmp_func_set()` 比较它们，并在 `srpc_bmp_func_t` 中置上“我能执行”的位。这是两个指针的比较，没有字符串，也没有符号查找。
+3. **交给守护进程（连接）。** 位图在 `connect()` 之后、收到内存池 FD 之前，以消息 `regfn_msg_t { size, sign[32], bmp }` 发给守护进程。守护进程检查大小和签名 `"simplerpc_" BUILD_TS`：这防止 `RPC_LIST` 不同的进程对接。
+4. **写入注册表（守护进程）。** `libsrpc_reg_func_form_bmp()` 把指向客户端 `libsrpc_proc_t` 的指针插入池中的注册表 `srpc_regfn_shm_t`。客户端从不写注册表。
 
-**链接注意事项：** 一个*仅*导出 RPC 函数的应用，可能对 `libsrpc.so` 的任何符号都没有引用。在链接器默认标志（`--as-needed`）下，`DT_NEEDED` 条目会被丢弃，库的构造函数不会执行，进程甚至根本不会接入内存池。因此 `example/` 和 `bench/` 中必须加 `-Wl,--no-as-needed`。
+**注册表结构**（每个函数一条记录）：
+
+* `main_block` —— 结构体内直接放 8 个 `_Atomic(libsrpc_proc_t *)` 槽。典型情况是每个函数只有少数执行方，不需要分配内存。
+* `ext_block` —— 主块溢出时分配一个比原来多 32 个槽的扩展，拷贝旧内容，新块经 CAS 发布。注册表只有一个写者，即守护进程的主线程；CAS 保护这次发布。
+* 旧的 `ext_block` 不立即释放：其签名被清零，块标记 `dc`，并唤醒 GC。这是一种类似 RCU 的延迟回收，因为其他进程中的读者可能还在遍历旧块。
+* `num_all` —— 该函数执行方的原子计数器。调用方读取它以预留应答槽。对外同一数值由 `libsrpc_fnreg_num_get()` 提供。`num_all == 0` 时调用立即以 `ENOREGFUN` 失败。
+* 槽的插入和删除用 CAS 完成，没有互斥锁。
+
+**注销**发生在套接字关闭时：`libsrpc_proc_destroy()` → `libsrpc_unreg_func_proc()` 把进程从所有注册表块中移除，并递减 `num_all`。
+
+**链接注意事项。** 一个只执行函数的应用可能不引用 `libsrpc.so` 的任何符号。在链接器标志 `--as-needed` 下，`DT_NEEDED` 依赖会被丢弃，库的构造函数不会执行，进程也不会接入内存池。因此 `example/` 和 `bench/` 使用 `-Wl,--no-as-needed`。
 
 ### 7. 进程与线程描述符
-`libsrpc_proc_t` 结构体由守护进程为每个连接的客户端在共享内存中创建（块类型 `LIBSRPC_SHMDT_PROC`），是所有发往该进程请求的入口点。
 
-* **签名与状态：** `sign`（`LIBSRPC_PROC_SIGN`）和 `status` 均为原子量。`libsrpc_proc_is_valid()` 要求签名正确且状态为 `RUN`，因此对进程的作废对所有其他进程立即可见，无需加锁。
-* **`proc_uid`：** 由守护进程签发的 16 位标识；用作 TLSF 分配器中的属主 UID。
-* **队列与信号量：** 每个进程拥有自己的 MPMC 队列，以及一个供其全部执行方线程共用的唤醒信号量 `sem_wakeup`。
-* **线程数组：** `threads[]` 位于同一内存块中，大小按在线 CPU 数（`sysconf(_SC_NPROCESSORS_ONLN)`）确定。工作线程本身按 `sched_getaffinity` 掩码启动（`pthread_start_all_cpu`）。每个元素含 `hp_req`——指向正在处理请求的 Hazard Pointer。
-* **请求列表：** `req_head` —— 该进程全部请求块的链表，供垃圾回收器遍历。
+守护进程在内存池中为每个连上的客户端创建结构 `libsrpc_proc_t`（块类型 `PROC`）。它是所有发给该客户端的请求的入口。
+
+* **签名与状态。** `sign`（`LIBSRPC_PROC_SIGN`）和 `status` 是原子的。`libsrpc_proc_is_valid()` 要求签名正确且状态为 `RUN`，因此进程失效对其他人立即可见，且无需加锁。
+* **`proc_uid`。** 守护进程签发的 16 位标识，也是分配器中的属主 UID。
+* **队列与信号量。** 进程有一条入站请求的 MPMC 队列，以及一个供其全部执行方线程使用的唤醒信号量 `sem_wakeup`。
+* **执行方线程。** 数组 `threads[]` 位于同一块中，大小为在线 CPU 数（`sysconf(_SC_NPROCESSORS_ONLN)`）。线程按 `sched_getaffinity` 掩码启动，每个可用核心一个，并绑定到该核心（`pthread_start_all_cpu`）。**每一个**加载了库的进程都得到这些线程，包括纯调用方。数组元素保存 `hp_req`——指向正在处理的请求的 Hazard Pointer。
+* **请求列表。** `req_head` 是该进程全部请求块的链表。垃圾回收器沿它查找仍被占用的请求，进程清理时沿它检查 UID 保持。
 
 ### 8. 同步与队列
-0.1.x 版本中自研的 futex 实现（`libsrpc_futex.*`）已删除；同步机制建立在共享内存中的 POSIX 原语之上。
 
-* **MPMC 队列：** 无锁队列 `lf_mpmc_queue`（Vyukov 方案：带 `seq` 计数器的单元数组），置于共享内存中的 `libsrpc_proc_t` 内。用于把任务从客户端交给执行方的工作线程。单元按缓存行对齐（`alignas(64)`），`head` 与 `tail` 分置于不同缓存行。容量为 2 的幂，构建时设定（`MPMCQ_DEGREE`，默认 `2^10 = 1024`）。单元中只存放指向共享内存中 `libsrpc_request_t` 的指针；工作线程通过 `resp->hp_proc` 找到自己的应答槽。
-* **POSIX 信号量：** 以 `pshared = 1` 初始化并置于共享内存的 `sem_t` 信号量，用于在队列无任务时使工作线程休眠与唤醒（节省 CPU）。外面包了一层薄薄的 `libsrpc_sem_*` 封装（`libsrpc_wrapper.h`），以便必要时替换实现。唤醒是按需的：存在等待线程（`threads_wait > 0`）或进程恰好只有一个工作线程（`threads_run == 1`）时才调用 `sem_post`。
-* **请求体内的信号量：** 每个 `libsrpc_request_t` 都自带一个 `sem_wakeup`——执行方用它通知调用线程应答已就绪。它取代了早期版本的"Job Futex"。
-* **自旋锁链表：** `libsrpc_list_spin` —— 单链表，写操作在 `pthread_spinlock_t` 保护下进行，遍历通过带 `acquire` 语义的原子加载实现无锁。用于进程列表和请求列表。
-* **定长块池：** `libsrpc_fixblockalloc` —— 基于 FIFO 索引环的快速池，支持自动扩容（`nextpool`），供守护进程在*本地*（非共享）内存中管理客户端连接描述符。它不含同步机制，按单线程使用设计——访问仅来自守护进程的主 `epoll` 循环。
+0.1.x 版本中自有的 futex（`libsrpc_futex.*`）已删除，同步建立在池中的 POSIX 原语上。
 
-### 9. 请求结构与应答协议
-共享内存中的一个块同时包含请求及其全部应答，因此应答无需额外分配。
+* **MPMC 队列。** `lf_mpmc_queue` 是 `libsrpc_proc_t` 内部按 Vyukov 方案实现的无锁队列（带 `seq` 计数器的单元数组）。单元按缓存行对齐（`alignas(64)`），`head` 和 `tail` 分处不同的行。容量是 2 的幂，构建时指定（`MPMCQ_DEGREE`，默认 `2^10 = 1024`）。单元里只放指向请求的指针，执行方按 `resp->hp_proc` 找到自己的应答槽。
+* **入队。** 队列满时调用方重试：16 轮，每轮 32 次并带 `pause` 指令，轮与轮之间 `sched_yield()`。如果始终没有空位，应答槽得到 `-ENOMEM`，请求不发给这个执行方。
+* **执行方等待。** 排空队列之后，执行方线程不立即入睡：大约 1024 次迭代里它带着暂停主动查看队列（`DEQUEUE_RETRY`、`libsrpc_cpu_pause(32)`）。之后才在 `threads_wait` 中登记，再查一次队列，然后在 `sem_wakeup` 上入睡。请求密集时，短暂的忙等省去一次唤醒，但每次请求之后都要花费 CPU 时间。
+* **唤醒。** 只有存在睡眠线程（`threads_wait > 0`）时，调用方才对进程信号量做 `sem_post`。`sem_t` 以 `pshared = 1` 创建，并包了一层薄的 `libsrpc_sem_*`（`libsrpc_wrapper.h`）。
+* **请求体内的信号量。** 每个 `libsrpc_request_t` 有自己的 `sem_wakeup`：应答就绪时，执行方用它唤醒调用线程。
+* **自旋锁链表。** `libsrpc_list_spin` 是单链表。写操作在 `pthread_spinlock_t` 下进行，遍历通过带 `acquire` 的原子加载实现无锁。用于进程列表、请求列表和 GC 的延迟块列表。
+* **固定大小块池。** `libsrpc_fixblockalloc` 是建立在 FIFO 索引环上、可增长（`nextpool`）的池。守护进程用它在**本地**内存中保存客户端连接描述符。池内没有同步：只有守护进程的 `epoll` 主循环接触它。
+
+### 9. 请求与应答
+
+内存池中的一个块同时包含请求及其全部应答，因此应答不再单独分配内存。
 
 ```text
 libsrpc_request_t
 +----------------------------------------------------------------------+
 | node | sem_wakeup | hp_regfn | sign | seq_num | funid | bufsz |      |
-| retoff | retsz | retnum |                                            |
+| retoff | retsz | retnum | gc_lock_uid |                              |
 +----------------------------------------------------------------------+
 | buf[]:                                                               |
 |   [参数 .......]  <- retoff = ALIGNLONG(len(args))                    |
@@ -121,84 +137,138 @@ libsrpc_request_t
 libsrpc_response_t: { hp_proc (等待谁应答), rc, buf[] }
 ```
 
-* **请求块缓存：** 指向最后一个块的指针保存在 TLS（`current_req`）中。若新请求放得下——直接复用该块，不触碰分配器；放不下——释放旧块并按两倍余量分配新块。热路径上根本不调用分配器。同一指针还服务于 `libsrpc_lastreq_num()` / `libsrpc_lastreq_get()`。
-* **就绪协议：** 执行方先置 `LIBSRPC_RC_FLAG_LOCK`（`0xC0000000`），拷贝结果后再发布 `LIBSRPC_RC_FLAG_READY`（`0x80000000`），或写入负的错误码。包装器中的客户端仅在与就绪标志精确匹配时才认为应答有效。
-* **校验：** `libsrpc_req_is_corrupted()` 检查签名（在读取字段前后各做一次带 `acquire` 语义的读取）以及尺寸的一致性。`libsrpc_req_destroy()` 通过 CAS 清除签名，因此重复销毁是安全的——这保护了 GC 与执行方并发工作时的 use-after-free。
-* **分派策略：** `RPC_SEND_ALL` —— 请求发给所有已注册的执行方（`retnum = num_all`）；`RPC_SEND_FIRST` —— 发给第一个可用的（`retnum = 1`）；`RPC_SEND_LAST` —— 发给遍历 `main_block` / `ext_block` 时的最后一个；`RPC_SEND_RR` —— 按轮询发给一个执行方（原子计数器 `req_send_rr`）。
-* **部分成功：** 若实际发出的请求数少于执行方数量，则期望的应答数相应下调；若一个都没发出去——调用方收到 `-ENOTAVAILABLE`。
-* **超时：** 等待应答是循环调用 `libsrpc_sem_wait_timeout_us`，每次唤醒后重新统计已就绪的槽位。间隔以微秒设置：`libsrpc_timeout_oneshot_set()`（下一次调用）、`libsrpc_timeout_func_set()`（指定函数）、`libsrpc_timeout_global_set()`（所有调用）；默认 `LIBSRPC_TIMEOUT_DEFAULT`（1 秒），下限 `LIBSRPC_TIMEOUT_MINIMUM`（100 微秒）。若在该间隔内未收齐应答，空槽被标记为 `-ERPCWAITIMEDOUT`。
+* **请求块缓存。** 指向线程最后一个块的指针保存在 TLS（`current_req`）中。新请求放得下就复用该块，不触碰分配器。放不下就按两倍余量分配新块。旧块立即释放；若其中还留着未写完或已超时的应答，则经 `dc` 标志和垃圾回收器释放。热路径上根本不调用分配器。同一指针还服务于 `libsrpc_lastreq_num()` / `libsrpc_lastreq_get()`。块作为线程数据注册（`pthread_key_create`），线程结束时释放。
+* **UID 保持（`gc_lock_uid`）。** 请求体中有四个 16 位槽。`libsrpc_shmem_proc_lock(idx, ptr)` 取应答槽 `idx` 的执行方。若 `tlsf_check_uid()` 确认 `ptr` 属于其 `proc_uid`，就把该 UID 写入空闲槽，函数返回槽号（`0…3`）。缓存块被替换时掩码复制到新块，复用时不清除。只要该 UID 还出现在某个存活进程的至少一个请求中，`libsrpc_proc_destroy()` 就不会立即释放该 UID 的用户块。保持绑定在线程上：由取走它的线程解除，并随线程或进程一起消失。
+* **就绪协议。** 执行方用 CAS 把标志 `LIBSRPC_RC_FLAG_LOCK`（`0xC0000000`）写入 `rc`，拷贝结果，再发布 `LIBSRPC_RC_FLAG_READY`（`0x80000000`）。负的 `rc` 是槽的错误码，`0` 表示还没有应答。包装器只在与就绪标志精确匹配时接受应答。槽仍处于 `LOCK` 状态时，它最多等待 100 次 `pause`。
+* **校验。** `libsrpc_req_is_corrupted()` 以两次带 `acquire` 的读取检查签名，一次在读字段之前，一次在之后，并检查尺寸是否一致。`libsrpc_req_destroy()` 通过 CAS 清除签名，因此重复销毁是安全的。这保护了 GC 与执行方同时工作时的 use-after-free。
+* **分派策略。** 注册表按顺序遍历：先 `main_block`，后 `ext_block`。
+  * `RPC_SEND_ALL` —— 请求发给所有执行方（`retnum = num_all`）。
+  * `RPC_SEND_FIRST` —— 发给第一个接受请求的执行方（`retnum = 1`）。
+  * `RPC_SEND_LAST` —— 发给遍历中最后一个非空槽。
+  * `RPC_SEND_RR` —— 按轮询发给一个执行方（原子计数器 `req_send_rr` 对 `num_all` 取模）。
+  * `LAST` 和 `RR` 没有后备执行方：所选进程没有接受请求时，调用以 `ENOTAVAILABLE` 结束。
+* **部分分派。** 实际发出的请求少于预留的槽时，期望的应答数相应减少。一个都发不出去时，调用以 `ENOTAVAILABLE` 结束。
+* **超时。** 调用方在 `libsrpc_sem_wait_timeout_us()` 循环中等待，每次唤醒后重新统计已就绪的槽。间隔以微秒设置：
+  * `libsrpc_timeout_oneshot_set()` —— 线程的下一次调用；
+  * `libsrpc_timeout_func_set()` —— 某个函数，限于该线程；
+  * `libsrpc_timeout_global_set()` —— 整个进程。
 
-### 10. 递归防护与错误处理
-* **TLS 标志：** 执行方线程中设置了 `srpc_disable_rpc_recursion`，因此执行方不能自行发起 RPC 调用——尝试将返回 `-ERECURSIVE`。
-* **调度器中的检查：** 调用前比较 `&name` 与 `&sRPCFN(name)` 的地址；若相等，说明该进程在没有本地实现的情况下进入了注册表，桩函数将会调用自身。
-* **错误码：** `libsrpc` 以自身错误码扩展系统 `errno`，编号紧随 `MAX_ERRNO` 之后：`ELIBNOINIT`、`ESHMNOINIT`、`ERPCDISABLE`、`ENOREGFUN`、`ERECURSIVE`、`ECANCELLED`、`ENOTAVAILABLE`、`ERPCWAITIMEDOUT`。它们存于 TLS 变量中，经 `libsrpc_errno_get()` 获取（`void` 函数无法返回错误码，故需要它），并由 `libsrpc_strerror()` 解码。
+  默认 `LIBSRPC_TIMEOUT_DEFAULT`（1 秒），下限 `LIBSRPC_TIMEOUT_MINIMUM`（100 微秒）。每次唤醒后间隔重新计时。若在间隔内没有新应答到达，空槽被标记为 `-ERPCWAITIMEDOUT`，等待结束。
+
+### 10. 递归与错误
+
+* **禁止递归。** 执行方线程中设置了 TLS 标志 `srpc_disable_rpc_recursion`，因此执行方不能从处理函数中自己发起 RPC 调用：请求不会发出，线程的码是 `ERECURSIVE`。
+* **调度器中的检查。** 调用前比较 `&name` 与 `&sRPCFN(name)` 的地址。二者相等说明该进程在没有本地实现的情况下进入了注册表，桩将会调用自身。这样的调用不会执行，槽一直没有应答，直到超时。
+* **自有错误码。** `libsrpc` 以 `MAX_ERRNO`（4095）之后的码扩展系统 `errno`：
+
+| 码 | 值 | 含义 |
+|---|---|---|
+| `ELIBNOINIT` | 4096 | 库未初始化 |
+| `ESHMNOINIT` | 4097 | 内存池未接入 |
+| `ERPCDISABLE` | 4098 | RPC 已关闭：与守护进程失去联系 |
+| `ENOREGFUN` | 4099 | 函数没有执行方 |
+| `ERECURSIVE` | 4100 | 禁止从执行方线程发起 RPC |
+| `ECANCELLED` | 4101 | 执行方在取走请求之前断开 |
+| `ENOTAVAILABLE` | 4102 | 没有可用的执行方或槽 |
+| `ERPCWAITIMEDOUT` | 4103 | 超时内没有应答 |
+| `ENOTFOUND` | 4104 | 块不属于该执行方（保持） |
+| `EPROCDESTROYED` | 4105 | 执行方已经断开（保持） |
+| `EINVALREQUEST` | 4106 | 没有可用的最近一次请求（保持） |
+| `EINVALRESPONSE` | 4107 | 没有可用的应答槽（保持） |
+
+* **码放在哪里。** 线程的错误码存在 TLS 变量中。包装器在调用开始时清零，并在请求发不出去时记下原因。经 `libsrpc_errno_get()` 读取，由 `libsrpc_strerror()` 解读。已发出请求的结局在其槽的 `rc` 中，由 `libsrpc_lastreq_get()` 返回。超时和取消不进入线程的码。
 
 ## 🔄 RPC 调用的生命周期
 
-1. **初始化：**
-   * 应用加载 `libsrpc.so`；优先级为 101 的构造函数执行。
-   * 构造函数通过 `dlsym(RTLD_NEXT)` 取得原始 `malloc`/`free`，并依据 `program_invocation_name` 检查当前进程是否为守护进程。若不是——fork 出守护进程（在 `bind()` 竞争中落败的守护进程会静默退出）。
-   * 启动控制线程 `unix_client`：连接守护进程的 Unix socket，发送本地已实现函数的位图，接收内存 FD，并按固定地址执行 `mmap`。
-   * 客户端取出自己的 `libsrpc_proc_t` 与 `proc_uid`，为每个可用 CPU 核心启动一个工作线程，置 `RUN` 状态并开启 RPC（`rpc_enable`）。
+1. **初始化。**
+   * 应用加载 `libsrpc.so`，优先级 101 的构造函数执行。
+   * 构造函数经 `dlsym(RTLD_NEXT)` 取得 `malloc`/`calloc`/`realloc`/`free` 的原始函数。它按 `program_invocation_name` 检查当前进程是不是守护进程本身。如果不是，就拉起守护进程（在 `bind()` 竞争中失败的守护进程静默退出）并启动 `unix_client` 控制线程。
+   * 线程连接守护进程的套接字，发送自己的函数位图，接收内存池 FD，并把它映射到固定地址。
+   * 线程找到自己的 `libsrpc_proc_t` 和 `proc_uid`，按可用 CPU 数量启动执行方线程，把状态置为 `RUN` 并允许 RPC。构造函数一直等到进程就绪才交还控制权。
 
-2. **函数调用（客户端侧）：**
-   * 用户调用 `log_write("Hello")`；符号解析到生成的包装器 `librpcimp_log_write`。
-   * 包装器从注册表读取 `num_all` —— 若没有执行方，立即返回 `-ENOREGFUN`。
-   * 在共享内存中分配（或复用缓存的）`libsrpc_request_t`，经 `libsrpc_shmem_malloc_type(..., LIBSRPC_SHMDT_REQUEST)`。
-   * 参数拷入 `req->buf`，布置应答槽。
-   * 对 `main_block`/`ext_block` 中的每个执行方，填充 `resp->hp_proc` 并把请求原子地入队其 MPMC 队列；必要时对进程信号量执行 `sem_post`。
-   * 客户端线程阻塞在 `req->sem_wakeup` 上等待应答。
+2. **调用（调用方一侧）。**
+   * 应用调用 `log_write("Hello")`。符号解析到生成的桩 `librpcimp_log_write`。
+   * 桩从注册表读取 `num_all`。没有执行方时，调用立即以 `ENOREGFUN` 结束。
+   * 取用缓存的 `libsrpc_request_t`，或分配新的（`libsrpc_shmem_malloc_type(..., LIBSRPC_SHMDT_REQUEST)`）。
+   * 参数拷贝进 `req->buf`，并划出应答槽。
+   * 对每个选中的执行方填入 `resp->hp_proc`，请求放入其 MPMC 队列。执行方有睡眠线程时，对进程信号量做 `sem_post`。
+   * 调用线程在 `req->sem_wakeup` 上入睡。
 
-3. **处理（服务端 / 工作线程）：**
-   * 后台工作线程（绑定在自己的 CPU 核心上）在进程信号量上醒来。
-   * 它从队列取出请求并发布 Hazard Pointer `thread->hp_req`，随后复查请求签名。
-   * 从缓冲区反序列化参数，调用真正的 `log_write()` 实现。
-   * 将返回值（若有）拷入自己的应答槽。
+3. **处理（执行方线程）。**
+   * 绑定在自己核心上的执行方线程从队列取出请求：或者在短暂的忙等期间，或者在进程信号量上醒来之后。
+   * 发布 Hazard Pointer `thread->hp_req`，并再次检查请求签名。
+   * 按 `hp_proc` 找到自己的槽，拆开参数，调用真正的 `log_write()`。
+   * 把结果写入槽：`LOCK` → 数据 → `READY`。
 
-4. **完成：**
-   * 工作线程将 `LIBSRPC_RC_FLAG_READY` 标志写入 `resp->rc`，对 `req->sem_wakeup` 执行 `sem_post`，并清除 Hazard Pointer。
-   * 客户端醒来，重新统计已收到的应答，收齐后读取结果。其余结果可通过 `libsrpc_lastreq_num()` / `libsrpc_lastreq_get()` 获取。
-   * 请求块在 TLS 中保持缓存以供下次调用；释放（`libsrpc_shmem_free`）发生在块被更大的块替换时，或进程清理期间。
+4. **结束。**
+   * 执行方对 `req->sem_wakeup` 做 `sem_post`，并撤下 Hazard Pointer。
+   * 调用方醒来，重新统计已就绪的槽。全部收齐后，包装器返回槽 0 的结果。其余的通过 `libsrpc_lastreq_num()` / `libsrpc_lastreq_get()` 取得。
+   * 请求块留在线程缓存中供下一次调用使用。
+
+## 💥 故障与恢复
+
+* **进程在分配器操作中途死亡。** 下一次取得内存池互斥锁时收到 `EOWNERDEAD`，并按 BUL 回滚未完成的操作。块内的应用数据不回滚：应用放在内存池中的结构由应用自己保护，例如用带 `EOWNERDEAD` 处理的健壮互斥锁。
+* **执行方死亡。** 守护进程看到套接字断开并调用 `libsrpc_proc_destroy()`：
+  * 进程从注册表中移除，其描述符失效；
+  * 执行方来不及从队列取走的请求得到 `-ECANCELLED`，调用方被唤醒；
+  * 执行方已经在处理的请求一直没有应答，调用方在超时后得到 `-ERPCWAITIMEDOUT`；
+  * 进程的块由 `tlsf_free_uid_blocks(pool, proc_uid, ...)` 遍历处理。没有人保持其 UID 时，用户块立即释放，否则推迟到 GC 列表。请求块被作废并标记 `dc`，进程描述符经 `libsrpc_shmem_free_dc()` 释放。
+* **调用方死亡。** 它的请求块被作废并交给 GC。若签名在执行方取走请求之前就被清掉，函数不会被调用。若发生在处理期间，函数会执行，但结果不会写入。执行方的 Hazard Pointer 撤下之后，GC 释放该块。
+* **保持的持有者死亡。** 保持检查只看存活进程的请求，而线程的请求块在线程结束时释放。因此保持随持有者一起消失，被推迟的块在下一轮 GC 归还内存池。死亡进程中忘记的 `unlock` 不会变成永久泄漏。
+* **执行方挂起。** 调用方在超时后得到 `-ERPCWAITIMEDOUT`。下一次调用时，带有过期槽的块被新块替换，旧块交给 GC。
+* **守护进程死亡。** 客户端看到套接字断开：它们的 RPC 被关闭（`rpc_enable = false`），执行方线程停止。没有重连。旧内存池的映射仍留在进程中，但新进程会拉起一个带新内存池的新守护进程，与已经在运行的进程互不相见。守护进程是单一故障点。
 
 ## 📊 交互示意图
 
 ```text
-                         +--------------------------------+
-                         |  Guard Daemon (memfd/fexecve)  |
-                         |  - abstract unix socket        |
-                         |  - owns SHM (memfd)            |
-                         |  - registry writer             |
-                         |  - GC thread                   |
-                         +--------------------------------+
-                           ^  SCM_RIGHTS (shm fd)      ^
-                           |  regfn bitmap             |  regfn bitmap
- +-------------------+     |                           |     +-------------------+
- |   Process A       |-----+                           +-----|   Process B       |
- |  (RPC Client)     |                                       |  (RPC Executor)   |
- +-------------------+                                       +-------------------+
-           |                                                           |
-           |  1. log_write("Msg")                                      |
-           v                                                           v
- +-------------------+          Shared Memory @ SHMEM_BASE_VADR   +-------------------+
- | RPC Wrapper       |  +--------------------------------------+   | Worker Thread     |
- | - read num_all    |<-| regfn: main_block[8] + ext_block[+32]|   | (pinned to CPU)   |
- | - Alloc Request   |  +--------------------------------------+   | - Publish hp_req  |
- | - Serialize Args  |  | tlsf_txn pool (uid / data_type / dc) |   | - Deserialize     |
- | - Enqueue ========|=>| proc_B: MPMC Queue + sem_wakeup       |==>| - Call Function   |
- | - Sem Wait        |  | request: [args][resp#0][resp#1]...    |   | - Write Result    |
- +-------------------+  +--------------------------------------+   +-------------------+
-           ^                                                           |
-           |                                                           |
-           +-----------------------------------------------------------+
-                   2. sem_post(req->sem_wakeup) / Result Read
- ```
+                        +--------------------------------+
+                        |  Guard Daemon (memfd/fexecve)  |
+                        |  - abstract unix socket        |
+                        |  - owns SHM (memfd)            |
+                        |  - registry writer             |
+                        |  - GC thread                   |
+                        +--------------------------------+
+                          ^  SCM_RIGHTS (shm fd)      ^
+                          |  regfn bitmap             |  regfn bitmap
++-------------------+     |                           |     +-------------------+
+|   Process A       |-----+                           +-----|   Process B       |
+|  (RPC Client)     |                                       |  (RPC Executor)   |
++-------------------+                                       +-------------------+
+          |                                                           |
+          |  1. log_write("Msg")                                      |
+          v                                                           v
++-------------------+          Shared Memory @ SHMEM_BASE_VADR   +-------------------+
+| RPC Wrapper       |  +--------------------------------------+   | Worker Thread     |
+| - read num_all    |<-| regfn: main_block[8] + ext_block[+32]|   | (pinned to CPU)   |
+| - Alloc Request   |  +--------------------------------------+   | - Publish hp_req  |
+| - Serialize Args  |  | tlsf_txn pool (uid / data_type / dc) |   | - Deserialize     |
+| - Enqueue ========|=>| proc_B: MPMC Queue + sem_wakeup       |==>| - Call Function   |
+| - Sem Wait        |  | request: [args][resp#0][resp#1]...    |   | - Write Result    |
++-------------------+  +--------------------------------------+   +-------------------+
+          ^                                                           |
+          |                                                           |
+          +-----------------------------------------------------------+
+                  2. sem_post(req->sem_wakeup) / Result Read
+```
 
 ## ⚙ 实现细节
 
-* **匿名内存（memfd）：** 使用 `memfd_create` 而非 `shm_open`，可以创建在文件系统（`/dev/shm`）中不可见的共享内存对象，提高安全性并简化资源清理：内存随描述符的最后一个引用一并消失。
-* **固定基地址：** 映射在 `SHMEM_BASE_VADR`（默认 `0x200000000000`）处以 `MAP_FIXED_NOREPLACE` 完成，因为池内存放的是**绝对**指针。`NOREPLACE` 标志保证：与既有映射冲突时，`mmap` 会报错，而不是悄悄覆盖他人区域。
-* **Fork 防护：** 对共享内存区域调用 `madvise(..., MADV_DONTFORK)`，防止子进程继承该内存并破坏 TLSF 分配器。
-* **多核：** 工作线程按被允许的 CPU 数（`sched_getaffinity`）创建，并通过 `pthread_attr_setaffinity_np`（`pthread_start_all_cpu`）绑定到核心，从而最小化上下文切换与缓存迁移开销。
-* **BUILD_TS 构建隔离：** 构建时间戳参与守护进程名、抽象 socket 名、共享内存签名以及注册消息签名。这实质上是一个自动生成的 ABI 版本：以不同 `libsrpc.so` 构建的应用彼此不可见。一个实际后果——应用不能脱离库单独重编。
-* **构建期参数化：** 池大小（`SHMEM_SIZE_KB`）、基地址（`SHMEM_BASE_VADR`）、队列容量（`MPMCQ_DEGREE`）、调试消息级别（`DBG_LVL`）以及分配器替换开关（`DISABLE_ALLOC`）均由 CMake 变量设定，并以 `-D` 定义的形式进入代码。
-* **严格构建标志：** 库与分配器均以 `-Wall -Wextra -Werror` 编译，因此强制显式标注未使用的参数（`__attribute__((unused))`）。
+* **匿名内存（memfd）。** 内存池用 `memfd_create` 创建，而不是 `shm_open`。它在 `/dev/shm` 中不可见，描述符的最后一次引用消失后什么也不留下：崩溃之后不需要手工清理。
+* **固定基地址。** 内存池内部是**绝对**指针，因此所有进程都以 `MAP_FIXED_NOREPLACE` 把它映射到 `SHMEM_BASE_VADR`（默认 `0x200000000000`）。地址已被占用时，映射老老实实创建失败，而不是覆盖别人的区域。
+* **防 fork。** 对内存池调用 `madvise(..., MADV_DONTFORK)`：子进程不继承内存池，也不能意外破坏分配器的元数据。`fork()` 之后子进程同样不能使用 RPC 和内存池。
+* **多核。** 执行方线程按允许的 CPU 数量创建，并通过 `pthread_attr_setaffinity_np` 绑定到核心，从而减少上下文切换和缓存迁移。
+* **通过 BUILD_TS 隔离构建。** 配置时间戳只编译进 `libsrpc.so`，并进入守护进程名、套接字名、内存池签名和注册消息签名。这实际上是自动生成的 ABI 版本：加载了不同库构建的进程互相看不见。应用本身不含这个戳。`RPC_LIST` 变化时仍需重新构建应用，因为原型和 `libsrpc_funid_<name>` 来自它。
+* **构建参数。** 内存池大小（`SHMEM_SIZE_KB`）、基地址（`SHMEM_BASE_VADR`）、队列容量（`MPMCQ_DEGREE`）、消息级别（`DBG_LVL`）和关闭分配器替换（`DISABLE_ALLOC`）由 CMake 变量指定，并以 `-D` 定义进入代码。
+* **严格的编译标志。** 分配器以 `-Wall -Wextra -Werror -Wformat` 构建，库以 `-Wall -Wextra -Werror -Wconversion -Wshadow` 构建。未使用的参数用 `__attribute__((unused))` 标记。
+* **绑定 x86_64。** 忙等使用 `__builtin_ia32_pause`，库以 `-mrdrnd` 构建。在其他架构上，代码不做修改就无法构建。
+
+## ⚠️ 已知限制
+
+* **超时从最近一次应答起算。** 分派给多个执行方时，每到一个应答就重新开始计时。最坏情况下，总等待时间接近执行方数量乘以超时。
+* **没有发出的调用可能返回旧值。** 请求发不出去时（`ERPCDISABLE`、`ERECURSIVE`、`ENOTAVAILABLE`），包装器读取被复用块的槽 0。里面可能还留着该线程上一次调用的结果，`libsrpc_lastreq_get(0)` 对它也返回 `0`。对有返回值的函数，原因码有时会被替换成 `ETIMEDOUT`。成功的可靠标志是 `libsrpc_errno_get() == 0` **并且**所需槽为 `0`。
+* **内存函数的错误码。** 编号与系统 `errno` 相同的 `TLSF_ERR_*` 会进入线程的码。`libsrpc_strerror()` 会把它们解错，需要 `tlsf_strerror()`。
+* **不检查客户端权限。** `SO_PEERCRED` 中只取 PID。任何以正确签名连上抽象套接字的进程都会得到整个内存池的可读写 FD。
+* **守护进程是单一故障点。** 没有向新守护进程重连（见「故障与恢复」）。
+* **没有内存池时的 `libsrpc_fnreg_num_get()`。** 函数不检查内存池是否已接入。与守护进程的连接失败时，调用会访问并不存在的内存。
+* **忙等的代价。** 每个进程都按 CPU 数量保持执行方线程，每次请求之后它们在入睡前都会转一会儿。
+* **固定的内存池。** 内存池大小在构建时确定，不会增长。同时接入的进程数受 16 位 `proc_uid` 限制。

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 
 project(srpc
-    VERSION 0.2.1
+    VERSION 0.3.0
     LANGUAGES C
 )
 message(STATUS "================================")
@@ -54,7 +54,7 @@ if(_bt STREQUAL "debug")
     endif()
 elseif(_bt STREQUAL "release")
     message(STATUS "Build type: RELEASE")
-    set(PROJECT_C_FLAGS   -O3 )
+    set(PROJECT_C_FLAGS   -O3)
 else()
     message(FATAL_ERROR "Unknown BUILD_TYPE '${BUILD_TYPE}'. Use: debug / release")
 endif()

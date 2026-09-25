@@ -53,15 +53,27 @@ typedef struct simplerpc_s {
   libsrpc_client_t cli;
 } __attribute__((aligned(CACHELINESIZE))) simplerpc_t;
 
-#define LIBSRPC_RC_FLAG_LOCK  (0xC0000000U) /* Флаг подготовки ответа */
-#define LIBSRPC_RC_FLAG_READY (0x80000000U) /* Флаг готовности ответа */
-#define LIBSRPC_RC_MASK_FLAGS (0x3FFFFFFFU) /* Маска для получения кода возврата */
-typedef int srpc_rc_t; // Внутренний код возврата при выполнении RPC запроса, возникший в исполнителе.
+typedef enum srpc_rc_staus_e { RC_ST_EMPTY = 0, RC_ST_LOCK, RC_ST_READY, RC_ST_ERROR } srpc_rc_staus_t;
+
+typedef union srpc_rc_u {
+  int rc;
+  struct {
+    int code:30; // Код возврата.
+    unsigned int st:2; // Статус ответа.
+  };
+} srpc_rc_t; // Внутренний код возврата при выполнении RPC запроса, возникший в исполнителе.
+
 typedef struct libsrpc_response_s {
   _Atomic(libsrpc_proc_t *) hp_proc;   // От кого ожидаем ответ, после получения ответа, Hazard Pointer будет установлен на NULL.
   _Atomic(srpc_rc_t)        rc;       // Внутренний код возврата при выполнении RPC запроса, возникший в исполнителе, или при его вызове.
+  uint16_t                  uid;      // UID процесса, от которого ожидаем ответ, для проверки ABA.
   unsigned char             buf[0];   // Буфер данных с ответом.
 } libsrpc_response_t;
+
+typedef union libsrpc_gc_lock_u {
+  uint64_t lock_all; // Блокировка очистки памяти по всем UID процесса от GC.
+  uint16_t lock[4];  // Блокировка очистки памяти по UID процесса от GC.
+} libsrpc_gc_lock_t;
 
 #define LIBSRPC_REQ_SIGN (0x741B8CD7U)
 typedef uint64_t libsrpc_req_ctrl_t;
@@ -76,6 +88,7 @@ typedef struct libsrpc_request_s {
               uint32_t  seq_num;  // Номер последовательности запроса.
     };
   };
+  _Atomic(libsrpc_gc_lock_t)   gc_lock_uid; // Блокировка очистки памяти UID процессов от GC.
   int                 funid;      // ID функции.
   unsigned int        bufsz;      // Размер буфера данных.
   unsigned int        retoff;     // Позиция в буфере для размещения первого ответа.
@@ -97,6 +110,10 @@ void libsrpc_bmp_func_set(srpc_bmp_func_t *bmp);
 int libsrpc_reg_func_form_bmp(libsrpc_proc_t *proc, srpc_bmp_func_t *bmp);
 int libsrpc_unreg_func_proc(libsrpc_proc_t *proc);
 
+/* Проверка блокировки освобождения GC разделяемой памяти процесса. uid - UID процесса. Возвращает 1 если блокировка установлена, 0 если нет. */
+int libsrpc_shmem_check_uid_lock(libsrpc_request_t *req, int uid);
+/* Проверка блокировки освобождения GC разделяемой памяти по UID процесса. uid - UID процесса. Возвращает 1 если блокировка установлена, 0 если нет. */
+int libsrpc_shmem_is_locked_uid(uint16_t uid);
 
 static inline int libsrpc_req_destroy(libsrpc_request_t *req)
 {
@@ -132,7 +149,7 @@ static inline int libsrpc_req_is_corrupted(libsrpc_request_t *req, libsrpc_req_c
   if(!req_tmp.retnum || !req_tmp.retsz) {
     return(1);
   }
-  size = sizeof(libsrpc_request_t) + req_tmp.retoff + req_tmp.retsz * req_tmp.retnum;
+  size = sizeof(libsrpc_request_t) + (size_t)req_tmp.retoff + (size_t)req_tmp.retsz * (size_t)req_tmp.retnum;
   if(req_tmp.bufsz < size) {
     return(1);
   }
@@ -151,6 +168,13 @@ static inline libsrpc_response_t * libsrpc_req_get_response_fast(libsrpc_request
     return(NULL);
   }
   libsrpc_request_t req_tmp = *req;
+  size_t size = sizeof(libsrpc_request_t) + (size_t)req_tmp.retoff + (size_t)req_tmp.retsz * (size_t)req_tmp.retnum;
+  if(req_tmp.bufsz < size) {
+    return(NULL);
+  }
+  if(idx >= req_tmp.retnum) {
+    return(NULL);
+  }
   unsigned int offset = req_tmp.retoff + req_tmp.retsz * idx;
   return((libsrpc_response_t *)&req->buf[offset]);
 }
@@ -170,33 +194,34 @@ static inline libsrpc_response_t * libsrpc_req_get_response(libsrpc_request_t *r
 
 static inline int libsrpc_req_response_set(libsrpc_request_t *req, libsrpc_response_t *resp, libsrpc_req_ctrl_t *ctrl, void *val, size_t sz)
 {
-  srpc_rc_t expected = 0;
+  srpc_rc_t expected = {0};
   if(libsrpc_req_is_corrupted(req, ctrl)) {
     return(-EINVAL);
   }
-  if(!atomic_compare_exchange_strong_explicit(&resp->rc, &expected, (srpc_rc_t)LIBSRPC_RC_FLAG_LOCK, memory_order_acquire, memory_order_relaxed)) {
+  if(!atomic_compare_exchange_strong_explicit(&resp->rc, &expected, (srpc_rc_t){.st = RC_ST_LOCK}, memory_order_acquire, memory_order_relaxed)) {
     return(-EBUSY);
   }
-  memcpy(&resp->buf[0], val, sz);
-  atomic_store_explicit(&resp->rc, (srpc_rc_t)LIBSRPC_RC_FLAG_READY, memory_order_release);
-  return((int)LIBSRPC_RC_FLAG_READY);
+  if(val && sz > 0) {
+    memcpy(&resp->buf[0], val, sz);
+  }
+  atomic_store_explicit(&resp->rc, (srpc_rc_t){.st = RC_ST_READY}, memory_order_release);
+  return(((srpc_rc_t){.st = RC_ST_READY}).rc);
 }
 
 static inline int libsrpc_req_response_get(libsrpc_response_t *resp, void *val, size_t sz)
 {
-  if(!resp || !val || !sz) {
+  if(!resp) {
     return(-EINVAL);
   }
-  for(int count = 0; count < 100; count++) {
+  for(int count = 0; count < 1024; count++) {
     srpc_rc_t final_rc = atomic_load_explicit(&resp->rc, memory_order_acquire);
-    if((unsigned)final_rc != 0 &&
-       (unsigned)final_rc != LIBSRPC_RC_FLAG_LOCK &&
-       (unsigned)final_rc != LIBSRPC_RC_FLAG_READY) {
-      return(-EBADFD);
+    if(final_rc.st == RC_ST_LOCK) continue;
+    if(final_rc.st == RC_ST_ERROR) {
+      return(final_rc.code < 0 ? final_rc.code : -EBADFD);
     }
-    if((unsigned)final_rc == LIBSRPC_RC_FLAG_READY) {
-      memcpy(val, &resp->buf, sz);
-      return(0);
+    if(final_rc.st == RC_ST_READY) {
+      if(val && sz > 0) memcpy(val, &resp->buf, sz);
+      return(final_rc.code);
     }
     __builtin_ia32_pause();
   }

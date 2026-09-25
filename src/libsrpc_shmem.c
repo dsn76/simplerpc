@@ -26,6 +26,8 @@ int libsrpc_shmem_create(libsrpc_shmem_pool_t *pool, char *name, size_t size, ui
 
     if(!pool || !name) return(-EINVAL);
 
+    pool->shm = NULL;
+
     //pool->shm_fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0666);
     pool->shm_fd = memfd_create(name, MFD_CLOEXEC);
 
@@ -90,7 +92,9 @@ end:
     return(rc);
 err:
     if(pool->shm) munmap(pool->shm, size);
+    pool->shm = NULL;
     if(pool->shm_fd > 0) close(pool->shm_fd);
+    pool->shm_fd = -1;
     goto end;
 }
 
@@ -146,6 +150,8 @@ int libsrpc_shmem_destroy(libsrpc_shmem_pool_t *pool)
 {
     int rc = 0;
 
+    if(!pool || !pool->shm) return(-EINVAL);
+
     libsrpc_shm_gc_destroy();
 
     rc = libsrpc_list_head_destroy(&pool->shm->proc_head);
@@ -161,6 +167,8 @@ int libsrpc_shmem_destroy(libsrpc_shmem_pool_t *pool)
     }
 
     close(pool->shm_fd);
+    pool->shm_fd = -1;
+    pool->shm = NULL;
 
     return(rc);
 }
@@ -315,6 +323,16 @@ int libsrpc_shmem_link(void *ptr)
         goto end;
     }
 end:
+    return(rc);
+}
+
+int libsrpc_shmem_get_size(void *ptr, size_t *psz)
+{
+    libsrpc_shmem_t *shm = libsrpc_shmem_get();
+    if(!shm) return(-EINVAL);
+    size_t sz = tlsf_get_block_size((tlsf_t)shm->poolptr, ptr);
+    if(!! psz) *psz = sz;
+    int rc = tlsf_get_errno((tlsf_t)shm->poolptr);
     return(rc);
 }
 

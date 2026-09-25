@@ -63,4 +63,6 @@ typedef struct srpc_bmp_func_s {
 
 /* ------------------------------------------------------------------------------ */
 
+int libsrpc_shmem_is_busy_regfn(srpc_regfn_ext_block_t *eb);
+
 #endif // FILE_LIBSRPC_PRIVATE_H

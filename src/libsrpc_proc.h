@@ -54,6 +54,8 @@ typedef struct libsrpc_proc_s {
 int libsrpc_proc_create(pid_t pid);
 int libsrpc_proc_destroy(pid_t pid);
 libsrpc_proc_t * libsrpc_proc_get(pid_t pid);
+/* 1, если какой-либо слот ответа держит resp->hp_proc на target. */
+int libsrpc_proc_cs_aimed_at(libsrpc_proc_t *target);
 
 static inline void libsrpc_proc_set_run(libsrpc_proc_t *proc)
 {

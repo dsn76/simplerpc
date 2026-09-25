@@ -40,4 +40,15 @@ int  libsrpc_list_remove(libsrpc_list_node_t *node);
              ((entry_ptr) = LIBSRPC_LIST_ENTRY(__lf_n, type, member), 1);            \
          __lf_n = atomic_load_explicit(&__lf_n->next, memory_order_acquire))
 
+#define LIBSRPC_LIST_FOREACH_SAFE(head_ptr, entry_ptr, type, member)              \
+         for (libsrpc_list_node_t *__lf_n =                                           \
+                  atomic_load_explicit(&(head_ptr)->first, memory_order_acquire),     \
+              *__lf_next = NULL;                                                       \
+              (__lf_n != NULL) &&                                                      \
+                  ((entry_ptr) = LIBSRPC_LIST_ENTRY(__lf_n, type, member),             \
+                   (__lf_next) =                                                        \
+                       atomic_load_explicit(&__lf_n->next, memory_order_acquire),      \
+                   1);                                                                  \
+              __lf_n = __lf_next)
+
 #endif /* LIBSRPC_LIST_SPIN_H */

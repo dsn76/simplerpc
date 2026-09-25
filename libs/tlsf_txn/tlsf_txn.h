@@ -163,6 +163,7 @@ int         tlsf_get_errno(tlsf_t tlsf);       /* последний код те
 const char *tlsf_strerror(int err);            /* принимает и отрицательные коды */
 size_t      tlsf_get_bul_capacity(tlsf_t tlsf);
 size_t      tlsf_get_bul_current_usage(tlsf_t tlsf);
+int tlsf_check_uid(tlsf_t tlsf, void *ptr, uint16_t uid);
 
 
 #endif /* TLSF_TXN_H */

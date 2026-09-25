@@ -16,6 +16,11 @@
     XF(ECANCELLED,"RPC call cancelled")  \
     XF(ENOTAVAILABLE,"Not available")  \
     XF(ERPCWAITIMEDOUT,"RPC wait timeout")  \
+    XF(ENOTFOUND,"Not found")  \
+    XF(EPROCDESTROYED,"Process destroyed")  \
+    XF(EINVALREQUEST,"Invalid request")  \
+    XF(EINVALRESPONSE,"Invalid response")  \
+    XF(EINVALPROC,"Invalid process")  \
 
 
 typedef enum {
