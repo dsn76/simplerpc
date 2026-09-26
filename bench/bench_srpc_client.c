@@ -117,6 +117,7 @@ int main(int ac, char **av)
     if (!slow) return 1;
 
     size_t okslow = 0;
+    uint64_t wall = 0;
     for (size_t i = 0; i < nslow; i++) {
         usleep(10 * 1000);
         uint64_t t0 = bench_now_ns();
@@ -128,9 +129,10 @@ int main(int ac, char **av)
             break;
         }
         slow[i] = t1 - t0;
+        wall += (t1 - t0);
         okslow++;
     }
-    bench_report("sRPC round-trip пауза 0.01с", slow, okslow, 0);
+    bench_report("sRPC round-trip пауза 0.01с", slow, okslow, wall);
     free(slow);
 
     /* 6. Однопоточный round-trip RPC. */

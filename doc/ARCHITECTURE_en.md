@@ -1,4 +1,4 @@
-# simplerpc Architecture
+# SimpleRPC Architecture
 
 This document describes the internal design of `libsrpc`: what the library is made of, how a call proceeds, what happens when processes die, and where the current implementation is weak. The user-facing side — build, API, examples — is described in the [README](../README_en.md).
 

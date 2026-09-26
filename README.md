@@ -1,4 +1,4 @@
-# simplerpc (libsrpc)
+# SimpleRPC (libsrpc)
 - Статус — в разработке.
 - Текущая версия 0.3.0
 - **Language:** 🇷🇺 **Русский** · 🇬🇧 [English](README_en.md) · 🇨🇳 [中文](README_zh.md)

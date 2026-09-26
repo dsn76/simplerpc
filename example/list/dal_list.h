@@ -6,6 +6,7 @@
 
 #include <pthread.h>
 #include <stdint.h>
+#include <errno.h>
 
 typedef enum dal_list_op_e {
     DAL_LIST_OP_GET_HEAD = 1,
@@ -84,7 +85,7 @@ static inline void dal_list_destroy(dal_list_head_t *head) {
 
 static inline int dal_list_lock(dal_list_head_t *head) {
     int rc = pthread_mutex_lock(&head->mutex);
-    if(rc == -EOWNERDEAD) {
+    if(rc == EOWNERDEAD) {
         rc = pthread_mutex_consistent(&head->mutex);
     }
     return rc;

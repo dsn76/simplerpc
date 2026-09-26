@@ -52,7 +52,7 @@ static inline void bench_report(const char *name, uint64_t *samples, size_t n,
 
     if (wall_ns > 0) {
         double rate = (double)n / ((double)wall_ns / 1e9);
-        printf("  %.0f оп/с", rate);
+        printf(" = %.0f оп/с", rate);
     }
     printf("\n");
     fflush(stdout);
