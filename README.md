@@ -2,7 +2,7 @@
 - Статус — в разработке.
 - Текущая версия 0.3.0
 - **Language:** 🇷🇺 **Русский** · 🇬🇧 [English](README_en.md) · 🇨🇳 [中文](README_zh.md)
-- [![Coverity Scan Build Status](https://scan.coverity.com/projects/33264/badge.svg)](https://scan.coverity.com/projects/simplerpc)
+- [![Coverity](https://scan.coverity.com/projects/33264/badge.svg)](https://scan.coverity.com/projects/simplerpc) [![CodeQL](https://github.com/dsn76/simplerpc/actions/workflows/codeql.yml/badge.svg)](https://github.com/dsn76/simplerpc/actions/workflows/codeql.yml)
 - [rpcgen](../../tree/rpcgen) — ветка, где X-макросы заменены кодогенерацией.
 
 **simplerpc** — библиотека удалённого вызова процедур (RPC) между процессами одной машины под Linux, написанная на C. Функция, объявленная в общем списке, вызывается как обычная C-функция, а выполняется в том процессе, который её определил.

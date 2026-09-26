@@ -2,7 +2,7 @@
 - 状态 — 开发中。
 - 当前版本 0.3.0
 - **Language:** 🇷🇺 [Русский](README.md) · 🇬🇧 [English](README_en.md) · 🇨🇳 **中文**
-- [![Coverity Scan Build Status](https://scan.coverity.com/projects/33264/badge.svg)](https://scan.coverity.com/projects/simplerpc)
+- [![Coverity Scan Build Status](https://scan.coverity.com/projects/33264/badge.svg)](https://scan.coverity.com/projects/simplerpc) [![CodeQL](https://github.com/dsn76/simplerpc/actions/workflows/codeql.yml/badge.svg)](https://github.com/dsn76/simplerpc/actions/workflows/codeql.yml)
 - [rpcgen](../../tree/rpcgen) — 用代码生成替换 X-macro 的分支。
 
 **simplerpc** 是一个用 C 编写的库，用于同一台 Linux 机器上进程之间的远程过程调用（RPC）。在公共列表中声明的函数像普通 C 函数一样调用，实际却在定义它的那个进程中执行。

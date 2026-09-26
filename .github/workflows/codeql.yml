@@ -1,0 +1,64 @@
+name: "CodeQL Advanced"
+
+# Запуск разрешен ТОЛЬКО вручную из панели управления GitHub Actions
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    name: Analyze (C)
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'cpp' ] # Для Си используется тот же анализатор 'cpp'
+
+    steps:
+      # Шаг 1: Клонирование репозитория
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Шаг 2: Принудительная установка xxd через менеджер пакетов apt
+      - name: Install xxd utility
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xxd
+
+      # Шаг 3: Инициализация CodeQL в ручном режиме
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: manual
+
+      # Шаг 4: Ручная сборка проекта на Си с использованием стандарта C17
+      - name: Build Project with xxd
+        run: |
+          echo "Проверка установленной версии xxd:"
+          xxd --version
+          
+          # РАСКОММЕНТИРУЙТЕ И НАСТРОЙТЕ ОДИН ИЗ ВАРИАНТОВ НИЖЕ В ЗАВИСИМОСТИ ОТ ВАШЕЙ СИСТЕМЫ СБОРКИ:
+          
+          # Вариант А: Если вы используете CMake для Си
+          # cmake -B build -DCMAKE_C_STANDARD=17
+          # cmake --build build
+          
+          # Вариант Б: Если у вас обычный Makefile (передаем флаг стандарта C17 компилятору GCC/Clang)
+          # make CFLAGS="-std=c17"
+          
+          # Вариант В: Если вы компилируете файлы напрямую через gcc
+          # gcc -std=c17 main.c -o my_project
+          
+          make all
+
+      # Шаг 5: Анализ собранного кода Си
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{matrix.language}}"
+

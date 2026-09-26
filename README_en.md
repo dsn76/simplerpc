@@ -2,7 +2,7 @@
 - Status — under development.
 - Current version 0.3.0
 - **Language:** 🇷🇺 [Русский](README.md) · 🇬🇧 **English** · 🇨🇳 [中文](README_zh.md)
-- [![Coverity Scan Build Status](https://scan.coverity.com/projects/33264/badge.svg)](https://scan.coverity.com/projects/simplerpc)
+- [![Coverity Scan Build Status](https://scan.coverity.com/projects/33264/badge.svg)](https://scan.coverity.com/projects/simplerpc) [![CodeQL](https://github.com/dsn76/simplerpc/actions/workflows/codeql.yml/badge.svg)](https://github.com/dsn76/simplerpc/actions/workflows/codeql.yml)
 - [rpcgen](../../tree/rpcgen) — a branch where the X-macros are replaced by code generation.
 
 **simplerpc** is a C library for remote procedure calls (RPC) between processes on a single Linux machine. A function declared in a shared list is called like an ordinary C function and runs in the process that defined it.
